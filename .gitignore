@@ -1,0 +1,14 @@
+__pycache__/
+*.pth
+*.pt
+*.tflite
+*.jpg
+*.jpeg
+*.png
+*.webp
+batch_outputs/
+physical_results/
+results_gemini3_test/
+eval_images/
+.env
+.ipynb_checkpoints/
