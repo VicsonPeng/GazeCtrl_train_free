@@ -40,7 +40,13 @@ SAM_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
 sys.path.insert(0, str(L2CS_DIR))
 
 # Gemini API
-GEMINI_API_KEY = "AIzaSyB5a_-zFj7QZ2naroAMxDkzzAT4I-x3hWI"
+import os
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_API_KEY_HERE")
 GEMINI_MODEL = "gemini-3-pro-image-preview"  # configurable via --model
 
 # ─────────────── Virtual pinhole camera ───────────────
