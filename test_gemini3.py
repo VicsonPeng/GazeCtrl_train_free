@@ -3,7 +3,8 @@ import os, mimetypes
 from google import genai
 from google.genai import types
 
-client = genai.Client(api_key="AIzaSyB5a_-zFj7QZ2naroAMxDkzzAT4I-x3hWI")
+import os
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", "YOUR_API_KEY_HERE"))
 
 # Read test image
 img_path = "eval_images/" + os.listdir("eval_images")[0]
