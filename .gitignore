@@ -6,9 +6,18 @@ __pycache__/
 *.jpeg
 *.png
 *.webp
+
+# pipeline outputs
+e_results/
+training_data/
 batch_outputs/
 physical_results/
 results_gemini3_test/
 eval_images/
+
 .env
 .ipynb_checkpoints/
+
+# allow curated README example images through the blanket image ignore above
+!assets/
+!assets/**

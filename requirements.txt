@@ -1,12 +1,22 @@
-google-genai>=1.0.0
+# Core pipeline (manual_process_path_e.py / dataset_pipeline.py)
 torch>=2.0.0
-segment-anything
 opencv-python>=4.8.0
-mediapipe>=0.10.0
 numpy>=1.24.0
-scipy>=1.10.0
 Pillow>=10.0.0
-matplotlib>=3.7.0
-face-detection>=0.2.0
-
+segment-anything
+huggingface_hub>=0.20.0
+google-genai>=1.0.0
 python-dotenv>=1.0.0
+
+# Gaze evaluation (estimate_gaze_batch.py --model l2cs, the default).
+# l2cs itself is NOT pip-installed: it is imported straight from the
+# L2CS-Net repo you clone next to this project (see README setup steps).
+# Its own runtime dependencies still need to be installed:
+pandas
+scipy
+matplotlib
+face_detection @ git+https://github.com/elliottzheng/face-detection
+
+# Optional: estimate_gaze_batch.py --model 6drepnet
+# torchvision
+# ultralytics
