@@ -11,14 +11,16 @@ warp/prompt-only approaches (Paths A–D) were tried and dropped.
 
 ## Example
 
-| Before | After (redirected to look at the camera) |
+| Before | After (redirected to look up and to the right) |
 |---|---|
 | ![before](assets/demo/before.png) | ![after](assets/demo/after.png) |
 
-Generated with `manual_process_path_e.py`: SAM segments the man, Gemini is
-told the gaze target is *in front of* him at a specific depth, and only his
-head/gaze changes — the rest of the scene (including the two other people)
-is left untouched.
+Generated with `manual_process_path_e.py`: SAM segments the person, a gaze
+target is placed off to the side at a specific depth, and Gemini redirects
+only her head/gaze — the background and clothing are left untouched, and the
+gap left behind by the head turn is seamlessly repainted.
+
+Photo: [Pexels](https://www.pexels.com/) (free-to-use license).
 
 <details>
 <summary>Intermediate pipeline outputs for this example</summary>
