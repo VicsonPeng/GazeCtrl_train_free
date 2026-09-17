@@ -9,6 +9,26 @@ This is "Path E" of a broader gaze-control research project — the approach tha
 worked well enough to become the main pipeline, after several earlier
 warp/prompt-only approaches (Paths A–D) were tried and dropped.
 
+## Example
+
+| Before | After (redirected to look at the camera) |
+|---|---|
+| ![before](assets/demo/before.png) | ![after](assets/demo/after.png) |
+
+Generated with `manual_process_path_e.py`: SAM segments the man, Gemini is
+told the gaze target is *in front of* him at a specific depth, and only his
+head/gaze changes — the rest of the scene (including the two other people)
+is left untouched.
+
+<details>
+<summary>Intermediate pipeline outputs for this example</summary>
+
+| Isolated person + gaze target (Image 1 sent to Gemini) | Depth map + target depth (Image 2 sent to Gemini) |
+|---|---|
+| ![isolated person](assets/demo/isolated_person.png) | ![isolated depth](assets/demo/isolated_depth.png) |
+
+</details>
+
 ## How it works
 
 ```
