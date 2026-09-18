@@ -52,19 +52,22 @@ depth map — dark/purple = far, bright/yellow = near):
 | ![depth far result](assets/ablation/depth_far.png) | ![depth near result](assets/ablation/full.png) | ![no depth result](assets/ablation/no_depth_prompt.png) |
 
 Same 2D point, two clearly different outcomes: told the target is *far
-behind her*, she turns her whole body around to look back over her
-shoulder; told the exact same screen position is *close, in front of her*,
-she only tilts her head/eyes up toward it, a smaller and less committed
-motion. Remove the depth image entirely and Gemini doesn't move her at
-all — a 2D point alone doesn't tell it whether "behind" is even a
-possibility.
+behind her*, she turns her whole body around — back almost fully to the
+camera — to look toward it; told the exact same screen position is *close,
+in front of her*, she only tilts her head/eyes up toward it, a smaller and
+less committed motion. Remove the depth image entirely and Gemini doesn't
+move her at all — a 2D point alone doesn't tell it whether "behind" is even
+a possibility.
 
-Getting the "BEHIND" case to reliably commit to a full turn (rather than a
-half-hearted glance, which is what repeated runs of the plain prompt
-sometimes produced) took an explicit nudge: `build_depth_aware_prompt` now
-adds an extra line for the `BEHIND` case specifically, spelling out that
-this requires physically turning around "the way someone turns around when
-they hear their name called from behind." That line is shipped in both
+Getting the "BEHIND" case to reliably commit to that full turn took two
+rounds of prompt tuning, not one. A first pass asking for a turn "the way
+someone turns around when they hear their name called from behind" got a
+head-and-shoulders check over the shoulder — better than nothing, but she
+stayed mostly front-on to the camera, which isn't really what "the target
+is behind her" should look like. `build_depth_aware_prompt`'s `BEHIND`
+case now spells out the geometry explicitly: the person's *back* should
+end up facing the camera, with the red dot now effectively in front of
+them, deeper into the scene. That's the line shipped in both
 `manual_process_path_e.py` and `dataset_pipeline.py`, not just used for
 this demo.
 

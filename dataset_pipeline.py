@@ -266,11 +266,14 @@ def build_depth_aware_prompt(chosen_depth, person_depth, extra=""):
     )
     if rel == "BEHIND":
         prompt += (
-            "The target is far away and behind the person's current line of sight, so "
-            "they must physically turn their head and upper body around to look back "
-            "over their shoulder toward it, the way someone turns around when they hear "
-            "their name called from behind — a large, obvious head-and-shoulder "
-            "rotation, not just a small glance or eye movement.\n"
+            "Because the target is so much farther away than the person, the only way "
+            "to actually look at it is to turn all the way around: the person must end "
+            "up with their BACK almost fully facing the camera, having rotated their "
+            "whole body away from its current orientation, with their head turned to "
+            "look toward the red dot, which now sits further ahead of them in this new "
+            "orientation, deeper into the scene. Do not just glance back over the "
+            "shoulder while staying mostly front-on to the camera — the body itself "
+            "must rotate away.\n"
         )
     if extra:
         prompt += extra.strip() + "\n"
