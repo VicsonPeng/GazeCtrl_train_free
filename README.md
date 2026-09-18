@@ -51,25 +51,34 @@ depth map — dark/purple = far, bright/yellow = near):
 | ![depth far](assets/ablation/depth_far_visual.png) | ![depth near](assets/ablation/depth_near_visual.png) | *(single image, no depth reference)* |
 | ![depth far result](assets/ablation/depth_far.png) | ![depth near result](assets/ablation/full.png) | ![no depth result](assets/ablation/no_depth_prompt.png) |
 
-Same 2D point, two completely different outcomes: told the target is *far
-behind her*, she turns her whole torso around to look back over her
-shoulder; told the exact same screen position is *close, in front of her*,
-she only turns her head/eyes toward it and her body stays put. Remove the
-depth image entirely and Gemini doesn't move her at all — a 2D point alone
-doesn't tell it whether "behind" is even a possibility.
+Same 2D point, two clearly different outcomes: told the target is *far
+behind her*, she turns further and more decisively to glance back over her
+shoulder, toward the camera; told the exact same screen position is *close,
+in front of her*, she only tilts her head/eyes up toward it, a smaller and
+less committed motion. Remove the depth image entirely and Gemini doesn't
+move her at all — a 2D point alone doesn't tell it whether "behind" is
+even a possibility. (Gemini's edits aren't perfectly repeatable — re-running
+the far-depth case a few times produced everything from almost no reaction
+to a full 180° turn-away; the version shown here is a representative
+middle-of-the-road result, not a cherry-picked best case.)
 
 ### 2. A visual marker beats describing the target in words
 
-| No visual prompt (text-only: *"look up and to her right, as if noticing something behind her shoulder"*) | With visual prompt (red-dot marker, same designed prompt) |
+| No visual prompt (text-only) | With visual prompt (red-dot marker, same designed prompt) |
 |---|---|
 | ![no visual prompt](assets/ablation/no_visual_prompt.png) | ![with visual prompt](assets/ablation/full.png) |
 
-The text-only version does turn her in roughly the right direction, but
-it's imprecise — there's no way to specify *exactly* which pixel to look
-at from words alone. It's also visibly noisier: without a marker to anchor
-the edit, the resulting pose drifts further from the original SAM mask,
-so the background-repair pass has a harder job and introduces grain/artifacts
-that the marker-guided version doesn't have.
+Getting the text-only version to point in the *same* direction as the
+marker-guided one took real effort. A generic direction in words ("look up
+and to her left/right") produced inconsistent results across repeated
+runs — sometimes the wrong side entirely, since without a marker there's
+no ground truth for which way "left/right" resolves once a profile pose is
+involved. It only became reliable once the prompt named a specific visible
+landmark in *this particular photo* ("the pine trees in the upper-right of
+the background"). That's the real cost of skipping the visual prompt: not
+that text can't work, but that making it work requires bespoke, per-image
+wording tied to describable landmarks — the opposite of a marker you can
+just click anywhere, including on featureless sky or a plain wall.
 
 ### 3. The designed text prompt keeps the edit contained
 
@@ -99,32 +108,32 @@ work in keeping the edit contained to just the gaze.
 
 *(pending — see below)*
 
-## Beyond gaze: turning a person all the way around
+## Beyond gaze: turning a person who has their back to the camera
 
 The pipeline was designed for gaze redirection, but the same
-mask + depth + prompt recipe generalizes further than expected: pointing
-the target at (roughly) the camera's own position, with a prompt telling
-Gemini the person currently has their back turned, gets a full 180°
-turn-around — not just eyes, the whole head and body:
+mask + depth + prompt recipe generalizes further than expected — no
+special-casing, just the standard tool with a target placed off to the
+side at close (in-front-of-camera) depth:
 
-| Before (facing away) | After (turned to face the camera) |
+| Before (facing away) | After (turned toward the camera) |
 |---|---|
 | ![before turnaround](assets/turnaround/before.png) | ![after turnaround](assets/turnaround/after.png) |
 
-Since her face isn't visible anywhere in the source photo, Gemini has to
-**invent** one from scratch — consistent with her visible hair color, build,
-and clothing, but not a real reconstruction of her actual face. That's a
-meaningfully different claim than the gaze-redirection demos above (which
-only ever reveal a face that's already partially visible in the source
-image), and worth keeping in mind for any use case where the generated
-face matters, not just the head pose.
+Since none of her face is visible in the source photo, any part of the
+turned face Gemini reveals is to some degree **invented**, not
+reconstructed — a meaningfully different claim than the gaze-redirection
+demos above, which only ever reveal a face that's already at least
+partially visible in the source image.
 
-Getting a clean result here also took an extra iteration: the first attempt
-placed the target at the back of her head's original 2D position, which
-made the newly generated face look *up* at it instead of at the camera —
-a reminder that with a full pose change like this, the target position
-needs to account for where the new face will actually end up, not just
-where the old head was.
+How much gets invented depends heavily on how far around you push the
+turn, and that turned out to matter a lot for consistency. Pushing for a
+full frontal turn (target placed right at the camera) worked, but
+sometimes let Gemini take too much creative liberty — hair color, coat
+texture, and even overall body scale could drift from the original. Aiming
+for a partial turn instead (target placed off to the side, at roughly
+head height, like the result above) reveals much less invented face while
+keeping her hair, coat, and proportions fully intact — a better trade-off
+if identity/wardrobe consistency matters more than seeing a full face.
 
 ## How it works
 
