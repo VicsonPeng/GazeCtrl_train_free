@@ -40,6 +40,8 @@ from model_utils import (
     load_sam_predictor,
     get_depth_anything,
     remove_red_marker,
+    clean_foreground_mask,
+    inpaint_small_holes,
     GEMINI_API_KEY,
     GEMINI_MODEL,
 )
@@ -407,11 +409,17 @@ def composite_and_repair(original_bgr, gemini_result, person_mask, repair_mode):
     # marker on large pose changes, so a fixed coordinate can't be trusted).
     gemini_result = remove_red_marker(gemini_result)
 
+    # Gemini's isolated-person edit sometimes leaves speckle noise outside the
+    # person's silhouette, or tiny near-black dropout pixels inside it (e.g. on
+    # a face). Clean to the largest connected blob, patch small internal holes
+    # locally, and blacken any stray noise outside the blob so it doesn't leak
+    # into the composite or force an unnecessary/noisy full-image repair.
+    new_mask = clean_foreground_mask(gemini_result)
+    gemini_result = inpaint_small_holes(gemini_result, new_mask)
+    gemini_result[new_mask == 0] = 0
+
     background = original_bgr.copy()
     background[person_mask > 2] = 0
-
-    gray = cv2.cvtColor(gemini_result, cv2.COLOR_BGR2GRAY)
-    _, new_mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
 
     composite = background.copy()
     composite[new_mask > 0] = 0
@@ -420,10 +428,20 @@ def composite_and_repair(original_bgr, gemini_result, person_mask, repair_mode):
     if repair_mode == "inpaint":
         final = repair_inpaint(composite)
     else:
-        final = repair_gemini(composite)
-        if final is None:
+        gemini_repaired = repair_gemini(composite)
+        if gemini_repaired is None:
             print("  [Warning] Gemini repair failed — falling back to inpaint.")
             final = repair_inpaint(composite)
+        else:
+            # Only take the gap pixels Gemini actually needed to fill; keep
+            # everything else pixel-exact from `composite`. Gemini's repair
+            # response can otherwise apply a slight re-encode/noise to the
+            # whole image, degrading regions that never needed touching.
+            gap_mask = cv2.inRange(composite, (0, 0, 0), (0, 0, 0))
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            gap_mask = cv2.dilate(gap_mask, kernel, iterations=1)
+            final = composite.copy()
+            final[gap_mask > 0] = gemini_repaired[gap_mask > 0]
 
     return composite, final
 

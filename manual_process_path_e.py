@@ -24,6 +24,8 @@ from model_utils import (
     get_depth_anything,
     load_sam_predictor,
     remove_red_marker,
+    clean_foreground_mask,
+    inpaint_small_holes,
     GEMINI_API_KEY,
     GEMINI_MODEL,
 )
@@ -156,15 +158,19 @@ def paste_back_and_repair(original_bgr, gemini_result, person_mask, out_dir, bas
     # 1b. 清除 Gemini 可能留下的紅點（大幅度姿態變化時，紅點座標不一定跟原本一樣）
     gemini_result = remove_red_marker(gemini_result)
 
+    # 1c. Gemini 的隔離人像輸出有時會在人物輪廓外散落雜訊噪點，
+    # 或在人物身上（例如臉上）留下極小的近黑色噪點孔洞。
+    # 先清成「只保留最大連通區塊」的乾淨遮罩，並就地修補人物身上的小孔洞，
+    # 避免這些雜訊被誤判為「新主角像素」貼到背景上，或被送進第二階段修補
+    # 導致 Gemini 對整張圖套用不必要的重新編碼／雜訊。
+    new_person_mask = clean_foreground_mask(gemini_result)
+    gemini_result = inpaint_small_holes(gemini_result, new_person_mask)
+    gemini_result[new_person_mask == 0] = 0  # blacken any stray speckle noise outside the cleaned blob
+
     # 2. 準備「帶洞背景」：先挖掉原本 SAM 抓出的舊位置
     background_with_hole = original_bgr.copy()
     background_with_hole[person_mask > 2] = 0
-    
-    # 3. 建立「新主角遮罩」：從 Gemini 回傳圖中找出非 0 的區域
-    # 這一步確保 Gemini 給的新數值會「完全蓋掉」該位置的背景
-    gemini_gray = cv2.cvtColor(gemini_result, cv2.COLOR_BGR2GRAY)
-    _, new_person_mask = cv2.threshold(gemini_gray, 1, 255, cv2.THRESH_BINARY)
-    
+
     # 4. 執行覆蓋：
     # 先把 background 中新主角會佔據的地方也挖空 (避免背景殘留)
     composite_image = background_with_hole.copy()
@@ -180,12 +186,23 @@ def paste_back_and_repair(original_bgr, gemini_result, person_mask, out_dir, bas
 
     # 5. 第二階段：填補黑色區塊 (pixel value 0)
     final_output = gemini_fill_background_gaps(composite_image, original_prompt)
-    
+
     if final_output is None:
         print("  [Warning] Gemini repair failed. Returning unfilled composite.")
         return composite_image
-        
-    return final_output
+
+    # 只取 Gemini 修補的黑色縫隙區域，其餘像素維持 composite_image 原樣。
+    # Gemini 的修補回應有時會對整張圖套用輕微的重新編碼/雜訊，如果整張直接採用，
+    # 連原本完全不需要修改的區域都會跟著劣化。
+    gap_mask = cv2.inRange(composite_image, (0, 0, 0), (0, 0, 0))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    gap_mask = cv2.dilate(gap_mask, kernel, iterations=1)
+    if cv2.countNonZero(gap_mask) == 0:
+        return composite_image
+
+    result = composite_image.copy()
+    result[gap_mask > 0] = final_output[gap_mask > 0]
+    return result
 
 
 # ── Person Depth Estimation ──

@@ -327,6 +327,15 @@ isolated-person / final / background images into a flat structure, and writes
 - Depth is *relative*, not metric — "in front of / behind" is inferred by
   comparing the depth value at the clicked target against the median depth
   inside the person's mask, not an absolute distance.
+- Gemini's "black" isolated-person background is often not exactly (0,0,0) —
+  faint compression-like noise can cover a large fraction of it. Both
+  `manual_process_path_e.py` and `dataset_pipeline.py` clean this up before
+  compositing (`model_utils.clean_foreground_mask` / `inpaint_small_holes`):
+  keep only the largest connected foreground blob, patch small internal
+  holes locally, and restrict the final Gemini repair pass to the pixels it
+  actually needed to fill rather than accepting its whole response — earlier
+  versions of this pipeline could otherwise turn a small hole into
+  full-image grain.
 
 ## License
 

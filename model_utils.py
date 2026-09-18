@@ -12,6 +12,7 @@ import urllib.request
 from pathlib import Path
 
 import cv2
+import numpy as np
 import torch
 
 # ─────────────── Project paths ───────────────
@@ -160,3 +161,59 @@ def remove_red_marker(image_bgr, pad=6):
     out = image_bgr.copy()
     out[red_mask > 0] = 0
     return out
+
+
+# ══════════════════════════════════════════════════════════════
+#  GEMINI OUTPUT NOISE CLEANUP
+# ══════════════════════════════════════════════════════════════
+#
+# Gemini's isolated-person edit is supposed to return the person on a pure
+# black background, but its "black" is often not exactly (0,0,0) - low-level
+# compression-like noise (pixel values ~1-4) can cover a large fraction of
+# the supposedly-black region. A naive >0 threshold treats all of that as
+# foreground, which then gets composited onto the real background as fake
+# "person" pixels. There can also be genuine tiny near-black dropout pixels
+# inside the person (e.g. on a face), which become tiny holes that the
+# background-repair pass also tries to fill - sometimes causing it to
+# re-render (and re-noise) the whole image instead of just the actual gap
+# left by the pose change.
+
+FOREGROUND_THRESHOLD = 20  # well above observed near-black compression noise (~1-4)
+
+
+def clean_foreground_mask(gemini_bgr, close_kernel=15, open_kernel=5):
+    """
+    Build a clean binary mask (0/255) of Gemini's actual (non-near-black)
+    foreground: closes small internal holes, opens away small external
+    speckles, and keeps only the single largest connected blob (the person).
+    """
+    gray = cv2.cvtColor(gemini_bgr, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(gray, FOREGROUND_THRESHOLD, 255, cv2.THRESH_BINARY)
+
+    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel, close_kernel))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_k)
+
+    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_kernel, open_kernel))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_k)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels > 1:
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        mask = np.where(labels == largest, 255, 0).astype(np.uint8)
+    return mask
+
+
+def inpaint_small_holes(gemini_bgr, foreground_mask):
+    """
+    Locally inpaint any black holes inside `foreground_mask` (e.g. speckle
+    dropouts on a face) so they don't need to go through the (much more
+    expensive, and sometimes noisy) background-repair image-edit pass.
+    """
+    gray = cv2.cvtColor(gemini_bgr, cv2.COLOR_BGR2GRAY)
+    _, non_black = cv2.threshold(gray, FOREGROUND_THRESHOLD, 255, cv2.THRESH_BINARY)
+    holes = cv2.bitwise_and(foreground_mask, cv2.bitwise_not(non_black))
+    if cv2.countNonZero(holes) == 0:
+        return gemini_bgr
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    holes = cv2.dilate(holes, kernel, iterations=1)
+    return cv2.inpaint(gemini_bgr, holes, 5, cv2.INPAINT_TELEA)
