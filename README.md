@@ -52,15 +52,21 @@ depth map — dark/purple = far, bright/yellow = near):
 | ![depth far result](assets/ablation/depth_far.png) | ![depth near result](assets/ablation/full.png) | ![no depth result](assets/ablation/no_depth_prompt.png) |
 
 Same 2D point, two clearly different outcomes: told the target is *far
-behind her*, she turns further and more decisively to glance back over her
-shoulder, toward the camera; told the exact same screen position is *close,
-in front of her*, she only tilts her head/eyes up toward it, a smaller and
-less committed motion. Remove the depth image entirely and Gemini doesn't
-move her at all — a 2D point alone doesn't tell it whether "behind" is
-even a possibility. (Gemini's edits aren't perfectly repeatable — re-running
-the far-depth case a few times produced everything from almost no reaction
-to a full 180° turn-away; the version shown here is a representative
-middle-of-the-road result, not a cherry-picked best case.)
+behind her*, she turns her whole body around to look back over her
+shoulder; told the exact same screen position is *close, in front of her*,
+she only tilts her head/eyes up toward it, a smaller and less committed
+motion. Remove the depth image entirely and Gemini doesn't move her at
+all — a 2D point alone doesn't tell it whether "behind" is even a
+possibility.
+
+Getting the "BEHIND" case to reliably commit to a full turn (rather than a
+half-hearted glance, which is what repeated runs of the plain prompt
+sometimes produced) took an explicit nudge: `build_depth_aware_prompt` now
+adds an extra line for the `BEHIND` case specifically, spelling out that
+this requires physically turning around "the way someone turns around when
+they hear their name called from behind." That line is shipped in both
+`manual_process_path_e.py` and `dataset_pipeline.py`, not just used for
+this demo.
 
 ### 2. A visual marker beats describing the target in words
 

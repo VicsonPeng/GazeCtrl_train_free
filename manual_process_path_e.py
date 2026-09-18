@@ -222,6 +222,14 @@ def build_depth_aware_prompt(chosen_depth, person_depth, facing_away):
         "OUTPUT: Return Image 1 with the person's new gaze. DO NOT move the red dot. Keep background black.\n"
         "TASK: On Image 1, IGNORE the person's current gaze and REDIRECT the person's eyes and HEAD to face the exact 3D position of the solid red dot.\n"
     )
+    if rel == "BEHIND":
+        prompt += (
+            "The target is far away and behind the person's current line of sight, so "
+            "they must physically turn their head and upper body around to look back "
+            "over their shoulder toward it, the way someone turns around when they hear "
+            "their name called from behind — a large, obvious head-and-shoulder "
+            "rotation, not just a small glance or eye movement.\n"
+        )
     return prompt
 
 
