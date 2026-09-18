@@ -31,38 +31,100 @@ Photo: [Pexels](https://www.pexels.com/) (free-to-use license).
 
 </details>
 
-## Ablation: why the depth prompt and the designed text matter
+## Ablation: what each design choice actually buys you
 
-The three pieces this pipeline actually leans on are the **person mask/isolation**,
-the **dual-image depth prompt**, and the **carefully worded text prompt**
-(explicit "ignore current gaze", "IN FRONT OF / BEHIND", "don't move the red
-dot" instructions). To check that these aren't just cargo-culted, the same
-photo, person, and gaze target were re-run with pieces removed:
+The pipeline leans on four things: **person mask/isolation**, the **depth
+value** attached to the gaze target, sending that target as a **visual
+(image) marker** rather than a text description, and a **carefully worded
+text prompt**. Each is tested below by changing only that one piece and
+re-running the same photo, person, and (where applicable) the same 2D
+target position.
 
-| Full method (mask + depth prompt + designed text) | No depth visual prompt (mask kept, single image, generic text) | No designed text prompt (mask + depth prompt kept, generic text) |
+### 1. The depth value is actually used — not decoration
+
+Same photo, same red-dot **2D screen position**, only the *depth value*
+assigned to that point changes (visualized as the ring's fill color on the
+depth map — dark/purple = far, bright/yellow = near):
+
+| Depth = far / "BEHIND the person" | Depth = near / "IN FRONT OF the person" | No depth image sent at all |
 |---|---|---|
-| ![full](assets/ablation/full.png) | ![no depth prompt](assets/ablation/no_depth_prompt.png) | ![no designed prompt](assets/ablation/no_designed_prompt.png) |
+| ![depth far](assets/ablation/depth_far_visual.png) | ![depth near](assets/ablation/depth_near_visual.png) | *(single image, no depth reference)* |
+| ![depth far result](assets/ablation/depth_far.png) | ![depth near result](assets/ablation/full.png) | ![no depth result](assets/ablation/no_depth_prompt.png) |
 
-- **Drop the depth image + use a generic prompt** ("make the person look at
-  the red dot," no depth reference) → Gemini doesn't redirect the gaze at
-  all. The pose is essentially identical to the input, and the red-dot
-  marker is left in the output uncleaned. Without the depth image telling
-  Gemini *where the target sits in 3D*, there's nothing for it to act on.
-- **Keep the mask + depth image but swap in a generic prompt** → the head
-  does turn this time, but the edit is far less controlled: a tree branch
-  that doesn't exist in the source photo gets hallucinated into the corner,
-  and the red dot again isn't cleaned up. The explicit instructions (ignore
-  current gaze, keep the background pixels, don't move the marker) are
-  doing real work in keeping the edit contained to just the gaze.
-- We also tested removing the person-mask/isolation step (sending the full,
-  un-isolated photo instead) — on this single-subject, simple-background
-  photo it didn't produce a visibly worse result, so it isn't shown here.
-  Isolation's main payoff shows up in settings this photo doesn't stress:
-  multi-person scenes (making sure Gemini edits the *right* person and
-  leaves everyone else alone) and pipelines that need pixel-exact,
-  guaranteed-unchanged backgrounds at dataset scale rather than
-  "usually looks fine."
+Same 2D point, two completely different outcomes: told the target is *far
+behind her*, she turns her whole torso around to look back over her
+shoulder; told the exact same screen position is *close, in front of her*,
+she only turns her head/eyes toward it and her body stays put. Remove the
+depth image entirely and Gemini doesn't move her at all — a 2D point alone
+doesn't tell it whether "behind" is even a possibility.
 
+### 2. A visual marker beats describing the target in words
+
+| No visual prompt (text-only: *"look up and to her right, as if noticing something behind her shoulder"*) | With visual prompt (red-dot marker, same designed prompt) |
+|---|---|
+| ![no visual prompt](assets/ablation/no_visual_prompt.png) | ![with visual prompt](assets/ablation/full.png) |
+
+The text-only version does turn her in roughly the right direction, but
+it's imprecise — there's no way to specify *exactly* which pixel to look
+at from words alone. It's also visibly noisier: without a marker to anchor
+the edit, the resulting pose drifts further from the original SAM mask,
+so the background-repair pass has a harder job and introduces grain/artifacts
+that the marker-guided version doesn't have.
+
+### 3. The designed text prompt keeps the edit contained
+
+| Full method (mask + depth prompt + designed text) | Mask + depth prompt kept, but generic text |
+|---|---|
+| ![full](assets/ablation/full.png) | ![no designed prompt](assets/ablation/no_designed_prompt.png) |
+
+Same two images, only the wording changes. The generic prompt ("look at
+the red dot in image 2, which shows depth") still gets a head turn, but
+loses control: a tree branch that doesn't exist in the source photo gets
+hallucinated into the corner, and the red-dot marker isn't cleaned up
+afterward. The designed prompt's explicit instructions (ignore current
+gaze, keep the background pixels, don't move the marker) are doing real
+work in keeping the edit contained to just the gaze.
+
+> The leftover red-dot marker visible in a couple of the images above was a
+> real bug at the time they were generated: Gemini doesn't always keep the
+> marker exactly where it was told to, especially on large pose changes, so
+> pasting its output back verbatim could leave a stray red dot in the final
+> image. The pipeline now detects and blanks out marker-colored pixels by
+> color (not fixed coordinates) before the repair pass, in both
+> `manual_process_path_e.py` and `dataset_pipeline.py` (see
+> `model_utils.remove_red_marker`), so this specific artifact no longer
+> occurs regardless of which prompt/mask configuration is used.
+
+### 4. Mask/isolation matters most with more than one person
+
+*(pending — see below)*
+
+## Beyond gaze: turning a person all the way around
+
+The pipeline was designed for gaze redirection, but the same
+mask + depth + prompt recipe generalizes further than expected: pointing
+the target at (roughly) the camera's own position, with a prompt telling
+Gemini the person currently has their back turned, gets a full 180°
+turn-around — not just eyes, the whole head and body:
+
+| Before (facing away) | After (turned to face the camera) |
+|---|---|
+| ![before turnaround](assets/turnaround/before.png) | ![after turnaround](assets/turnaround/after.png) |
+
+Since her face isn't visible anywhere in the source photo, Gemini has to
+**invent** one from scratch — consistent with her visible hair color, build,
+and clothing, but not a real reconstruction of her actual face. That's a
+meaningfully different claim than the gaze-redirection demos above (which
+only ever reveal a face that's already partially visible in the source
+image), and worth keeping in mind for any use case where the generated
+face matters, not just the head pose.
+
+Getting a clean result here also took an extra iteration: the first attempt
+placed the target at the back of her head's original 2D position, which
+made the newly generated face look *up* at it instead of at the camera —
+a reminder that with a full pose change like this, the target position
+needs to account for where the new face will actually end up, not just
+where the old head was.
 
 ## How it works
 

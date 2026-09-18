@@ -39,6 +39,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from model_utils import (
     load_sam_predictor,
     get_depth_anything,
+    remove_red_marker,
     GEMINI_API_KEY,
     GEMINI_MODEL,
 )
@@ -389,6 +390,10 @@ def composite_and_repair(original_bgr, gemini_result, person_mask, repair_mode):
     h, w = original_bgr.shape[:2]
     if gemini_result.shape[:2] != (h, w):
         gemini_result = cv2.resize(gemini_result, (w, h), interpolation=cv2.INTER_LANCZOS4)
+
+    # Clear any leftover red target-dot pixels (Gemini can relocate/redraw the
+    # marker on large pose changes, so a fixed coordinate can't be trusted).
+    gemini_result = remove_red_marker(gemini_result)
 
     background = original_bgr.copy()
     background[person_mask > 2] = 0

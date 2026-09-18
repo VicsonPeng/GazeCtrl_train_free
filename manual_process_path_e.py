@@ -23,6 +23,7 @@ import tkinter as tk
 from model_utils import (
     get_depth_anything,
     load_sam_predictor,
+    remove_red_marker,
     GEMINI_API_KEY,
     GEMINI_MODEL,
 )
@@ -151,6 +152,9 @@ def paste_back_and_repair(original_bgr, gemini_result, person_mask, out_dir, bas
     if gemini_result.shape[:2] != (h, w):
         print(f"  [Fix] Resizing Gemini result to {(h, w)}")
         gemini_result = cv2.resize(gemini_result, (w, h), interpolation=cv2.INTER_LANCZOS4)
+
+    # 1b. 清除 Gemini 可能留下的紅點（大幅度姿態變化時，紅點座標不一定跟原本一樣）
+    gemini_result = remove_red_marker(gemini_result)
 
     # 2. 準備「帶洞背景」：先挖掉原本 SAM 抓出的舊位置
     background_with_hole = original_bgr.copy()

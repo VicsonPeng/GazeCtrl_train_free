@@ -11,6 +11,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
+import cv2
 import torch
 
 # ─────────────── Project paths ───────────────
@@ -130,3 +131,32 @@ def get_l2cs_pipeline():
     )
     print("[L2CS] Ready.")
     return _l2cs_pipeline
+
+
+# ══════════════════════════════════════════════════════════════
+#  RED TARGET-DOT CLEANUP
+# ══════════════════════════════════════════════════════════════
+
+def remove_red_marker(image_bgr, pad=6):
+    """
+    Blacken any leftover red target-dot pixels in a Gemini-edited image, so
+    the downstream black-gap repair pass fills them in along with everything
+    else in a single call.
+
+    Gemini is told not to move the red dot, but on large pose changes (e.g.
+    turning a person all the way around) it may relocate or redraw it, so a
+    fixed coordinate can't be trusted — this detects the marker by color
+    instead.
+    """
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    red_mask = (
+        cv2.inRange(hsv, (0, 120, 120), (10, 255, 255)) |
+        cv2.inRange(hsv, (160, 120, 120), (180, 255, 255))
+    )
+    if cv2.countNonZero(red_mask) == 0:
+        return image_bgr
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pad, pad))
+    red_mask = cv2.dilate(red_mask, kernel, iterations=1)
+    out = image_bgr.copy()
+    out[red_mask > 0] = 0
+    return out
