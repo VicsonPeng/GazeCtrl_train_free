@@ -31,6 +31,39 @@ Photo: [Pexels](https://www.pexels.com/) (free-to-use license).
 
 </details>
 
+## Ablation: why the depth prompt and the designed text matter
+
+The three pieces this pipeline actually leans on are the **person mask/isolation**,
+the **dual-image depth prompt**, and the **carefully worded text prompt**
+(explicit "ignore current gaze", "IN FRONT OF / BEHIND", "don't move the red
+dot" instructions). To check that these aren't just cargo-culted, the same
+photo, person, and gaze target were re-run with pieces removed:
+
+| Full method (mask + depth prompt + designed text) | No depth visual prompt (mask kept, single image, generic text) | No designed text prompt (mask + depth prompt kept, generic text) |
+|---|---|---|
+| ![full](assets/ablation/full.png) | ![no depth prompt](assets/ablation/no_depth_prompt.png) | ![no designed prompt](assets/ablation/no_designed_prompt.png) |
+
+- **Drop the depth image + use a generic prompt** ("make the person look at
+  the red dot," no depth reference) → Gemini doesn't redirect the gaze at
+  all. The pose is essentially identical to the input, and the red-dot
+  marker is left in the output uncleaned. Without the depth image telling
+  Gemini *where the target sits in 3D*, there's nothing for it to act on.
+- **Keep the mask + depth image but swap in a generic prompt** → the head
+  does turn this time, but the edit is far less controlled: a tree branch
+  that doesn't exist in the source photo gets hallucinated into the corner,
+  and the red dot again isn't cleaned up. The explicit instructions (ignore
+  current gaze, keep the background pixels, don't move the marker) are
+  doing real work in keeping the edit contained to just the gaze.
+- We also tested removing the person-mask/isolation step (sending the full,
+  un-isolated photo instead) — on this single-subject, simple-background
+  photo it didn't produce a visibly worse result, so it isn't shown here.
+  Isolation's main payoff shows up in settings this photo doesn't stress:
+  multi-person scenes (making sure Gemini edits the *right* person and
+  leaves everyone else alone) and pipelines that need pixel-exact,
+  guaranteed-unchanged backgrounds at dataset scale rather than
+  "usually looks fine."
+
+
 ## How it works
 
 ```
