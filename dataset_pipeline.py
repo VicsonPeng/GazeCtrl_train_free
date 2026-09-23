@@ -253,7 +253,7 @@ def build_depth_aware_prompt(chosen_depth, person_depth, extra=""):
     diff = float(chosen_depth) - float(person_depth)
     if abs(diff) < 30:
         rel = "at the same depth as"
-    elif diff > 30:
+    elif diff >= 30:
         rel = "IN FRONT OF (closer to camera than)"
     else:
         rel = "BEHIND"

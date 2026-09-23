@@ -225,11 +225,11 @@ def build_depth_aware_prompt(chosen_depth, person_depth, facing_away):
     depth_diff = float(chosen_depth) - float(person_depth)
     # 這裡的邏輯：
     # Brighter is closer (larger value). 
-    # If chosen_depth > person_depth + 30: target is IN FRONT
+    # If chosen_depth >= person_depth + 30: target is IN FRONT
     # If chosen_depth < person_depth - 30: target is BEHIND
     if abs(depth_diff) < 30:
         rel = "at the same depth as"
-    elif depth_diff > 30:
+    elif depth_diff >= 30:
         rel = "IN FRONT OF (closer to camera than)"
     else:
         rel = "BEHIND"
