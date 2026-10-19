@@ -204,6 +204,7 @@ and produces much more consistent head/eye redirection.
 | [dataset_pipeline.py](dataset_pipeline.py) | **Batch, folder of images.** Same pipeline, run over many images with a resumable, numbered-step output per sample + a JSON manifest. |
 | [estimate_gaze_batch.py](estimate_gaze_batch.py) | Runs a gaze-estimation model (L2CS-Net by default) on the pipeline's output and records the angular error against the originally-requested gaze target. |
 | [build_training_set.py](build_training_set.py) | Filters `dataset_pipeline.py` output by angular error and packages it into a flat `manifest.csv` — meant to feed a downstream model (e.g. a distilled ControlNet), not part of the training-free pipeline itself. |
+| [eval_gt.py](eval_gt.py) | Builds an **evaluation set** for the training-based model: one mask + face click per photo, then gaze targets are auto-chosen so accepted samples spread evenly over yaw (full 360°) × pitch bins; human review in rounds. See "Evaluation-set GT" below. |
 
 `sam_vit_h_4b8939.pth` (the SAM checkpoint) is auto-downloaded on first run and
 is git-ignored — don't expect it to be in the repo.
@@ -311,6 +312,34 @@ python build_training_set.py --results-dir e_results --dry-run   # just print st
 Keeps only samples under the angular-error threshold, copies the
 isolated-person / final / background images into a flat structure, and writes
 `manifest.csv` + `stats.json`.
+
+### 5. Evaluation-set GT (for the training-based model)
+
+```bash
+python eval_gt.py prep                              # per photo: SAM mask + click the face (eye midpoint)
+python eval_gt.py plan --round 1 --per-image 10     # pick targets from the least-filled bins (no API calls)
+python eval_gt.py run --workers 3                   # Gemini edit; gap repair = inpaint while screening
+python eval_gt.py review --round 1                  # y = OK, n = bad, s = skip, b = back, q = quit
+python eval_gt.py stats                             # accepted count per yaw x pitch bin
+python eval_gt.py plan --round 2 --per-image 4      # next round favours bins that are still empty
+python eval_gt.py finalize                          # Gemini gap repair for accepted only, export final/
+```
+
+Data lives in `../eval_dataset/` (`raw/` in; `prep/`, `candidates/`,
+`reviews.json`, `final/` out). Bins are 12 yaw (centred on −180…150, 30°
+wide) × 3 pitch (down/level/up, ±45° max). Instead of sampling a random red
+dot, `plan` picks a target direction and solves for the dot position + depth
+that request it, so the label is exact by construction. Labels use the
+training-based pipeline's convention (dx>0 image-right, dy>0 up, dz>0 toward
+camera; yaw = atan2(dx, dz), pitch = asin(dy)) and are the *requested*
+direction under the same pinhole/disparity model as `compute_target_gaze`
+(Z ∝ 1/depth, f = 0.8·width), without that function's forward-hemisphere
+clamp. The prompt adds an orientation clause sized to the requested yaw
+(the stock BEHIND clause always asks for a full turn away, which would
+contradict e.g. yaw 110°), and judges in front / behind from the depth ratio
+rather than an absolute ±30 difference, which mislabels distant people.
+Close-up faces near the image centre can't express near-frontal directions
+with an on-screen dot; `plan` reports such infeasible bins.
 
 ## Notes & limitations
 
