@@ -138,28 +138,41 @@ def get_l2cs_pipeline():
 #  RED TARGET-DOT CLEANUP
 # ══════════════════════════════════════════════════════════════
 
-def remove_red_marker(image_bgr, pad=6):
+def red_marker_mask(image_bgr, pad=5):
     """
-    Blacken any leftover red target-dot pixels in a Gemini-edited image, so
-    the downstream black-gap repair pass fills them in along with everything
-    else in a single call.
+    Mask (0/255) of the red target dot in a Gemini-edited image.
 
     Gemini is told not to move the red dot, but on large pose changes (e.g.
     turning a person all the way around) it may relocate or redraw it, so a
-    fixed coordinate can't be trusted — this detects the marker by color
-    instead.
+    fixed coordinate can't be trusted — the marker is found by color instead.
+    Only small, compact, near-pure-red blobs count: an earlier HSV hue-range
+    test (H 0-10, S/V >= 120) also matched warm skin, sunset-lit hair, lips
+    and red clothing, and blacked out large parts of faces.
     """
-    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    red_mask = (
-        cv2.inRange(hsv, (0, 120, 120), (10, 255, 255)) |
-        cv2.inRange(hsv, (160, 120, 120), (180, 255, 255))
-    )
-    if cv2.countNonZero(red_mask) == 0:
+    b, g, r = (image_bgr[..., i].astype(np.int16) for i in range(3))
+    cand = ((r >= 140) & (r - np.maximum(g, b) >= 100)).astype(np.uint8) * 255
+    out = np.zeros(cand.shape, np.uint8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    for i in range(1, n):
+        area = stats[i, cv2.CC_STAT_AREA]
+        bw, bh = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+        if not 120 <= area <= 4000:               # redrawn dots seen: 138-2984 px; lips ~60
+            continue
+        if not 0.5 <= bw / bh <= 2.0 or area / (bw * bh) < 0.55:   # a disc fills ~0.785
+            continue
+        out[labels == i] = 255
+    if pad and cv2.countNonZero(out):
+        out = cv2.dilate(out, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pad, pad)))
+    return out
+
+
+def remove_red_marker(image_bgr, pad=5):
+    """Blacken the red target dot (see red_marker_mask)."""
+    m = red_marker_mask(image_bgr, pad)
+    if cv2.countNonZero(m) == 0:
         return image_bgr
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pad, pad))
-    red_mask = cv2.dilate(red_mask, kernel, iterations=1)
     out = image_bgr.copy()
-    out[red_mask > 0] = 0
+    out[m > 0] = 0
     return out
 
 
@@ -168,52 +181,100 @@ def remove_red_marker(image_bgr, pad=6):
 # ══════════════════════════════════════════════════════════════
 #
 # Gemini's isolated-person edit is supposed to return the person on a pure
-# black background, but its "black" is often not exactly (0,0,0) - low-level
-# compression-like noise (pixel values ~1-4) can cover a large fraction of
-# the supposedly-black region. A naive >0 threshold treats all of that as
-# foreground, which then gets composited onto the real background as fake
-# "person" pixels. There can also be genuine tiny near-black dropout pixels
-# inside the person (e.g. on a face), which become tiny holes that the
-# background-repair pass also tries to fill - sometimes causing it to
-# re-render (and re-noise) the whole image instead of just the actual gap
-# left by the pose change.
+# black background, but its "black" is not exactly (0,0,0): over 215 eval
+# outputs the noise is <= 3 at the 99.9th percentile in most images, with
+# sparse specks up to ~19 in a few. Dark hair/clothing/shadow on the person
+# overlaps that range, so brightness alone can't separate them; the mask
+# below combines a low threshold with blob-size filtering and hole filling.
+#
+# Earlier version (threshold 20, keep only the largest blob, inpaint every
+# dark pixel inside it) dropped whole heads whenever the person was split
+# in two by a black region (e.g. another person's arm cut out of the mask),
+# and turned dark hair/clothing into background-coloured holes.
 
-FOREGROUND_THRESHOLD = 20  # well above observed near-black compression noise (~1-4)
+FOREGROUND_THRESHOLD = 8   # on the max channel; above typical noise, below most dark hair
 
 
-def clean_foreground_mask(gemini_bgr, close_kernel=15, open_kernel=5):
+def foreground_mask(gemini_bgr, person_mask=None):
     """
-    Build a clean binary mask (0/255) of Gemini's actual (non-near-black)
-    foreground: closes small internal holes, opens away small external
-    speckles, and keeps only the single largest connected blob (the person).
+    Binary mask (0/255) of the person Gemini actually drew.
+
+    Keeps every sizeable blob, not only the largest: blobs touching the
+    original SAM mask are kept regardless, other blobs only if they're at
+    least 2% the size of the largest (speckle noise is far smaller). Small
+    enclosed holes (pupils, dark folds, the removed marker) are filled;
+    large ones are left out, since they're usually background the new pose
+    exposes.
     """
-    gray = cv2.cvtColor(gemini_bgr, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, FOREGROUND_THRESHOLD, 255, cv2.THRESH_BINARY)
+    h, w = gemini_bgr.shape[:2]
+    m = (gemini_bgr.max(axis=2) > FOREGROUND_THRESHOLD).astype(np.uint8) * 255
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
 
-    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel, close_kernel))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_k)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if n <= 1:
+        return m
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest = int(areas.max())
+    min_area = max(64, int(2e-4 * h * w))
+    near = None
+    if person_mask is not None:
+        near = cv2.dilate((person_mask > 0).astype(np.uint8),
+                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
+    keep = np.zeros(n, bool)
+    for i in range(1, n):
+        a = stats[i, cv2.CC_STAT_AREA]
+        if a < min_area:
+            continue
+        if a >= 0.02 * largest:
+            keep[i] = True
+        elif near is not None:
+            x, y, bw, bh = stats[i, :4]
+            comp = labels[y:y + bh, x:x + bw] == i
+            keep[i] = near[y:y + bh, x:x + bw][comp].mean() >= 0.3
+    m = np.where(keep[labels], 255, 0).astype(np.uint8)
 
-    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_kernel, open_kernel))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_k)
+    # Fill enclosed holes (not connected to the image border) up to 0.1% of the frame.
+    inv = cv2.bitwise_not(m)
+    n2, lab2, st2, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
+    x, y, bw, bh, a = (st2[:, i] for i in range(5))
+    fill = (a <= int(1e-3 * h * w)) & (x > 0) & (y > 0) & (x + bw < w) & (y + bh < h)
+    fill[0] = False
+    m[fill[lab2]] = 255
+    return m
 
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    if num_labels > 1:
-        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-        mask = np.where(labels == largest, 255, 0).astype(np.uint8)
-    return mask
 
-
-def inpaint_small_holes(gemini_bgr, foreground_mask):
+def composite_onto_background(original_bgr, gemini_bgr, person_mask):
     """
-    Locally inpaint any black holes inside `foreground_mask` (e.g. speckle
-    dropouts on a face) so they don't need to go through the (much more
-    expensive, and sometimes noisy) background-repair image-edit pass.
+    Paste Gemini's redirected person over the original photo.
+
+    Returns (composite, gap_mask): composite has the edited person on top,
+    the original background elsewhere, and black (0) in gap_mask — pixels
+    the old person covered that the new pose no longer does. Repair passes
+    must use gap_mask rather than "pixel == 0", because genuinely black hair
+    or clothing is also 0.
     """
-    gray = cv2.cvtColor(gemini_bgr, cv2.COLOR_BGR2GRAY)
-    _, non_black = cv2.threshold(gray, FOREGROUND_THRESHOLD, 255, cv2.THRESH_BINARY)
-    holes = cv2.bitwise_and(foreground_mask, cv2.bitwise_not(non_black))
-    if cv2.countNonZero(holes) == 0:
-        return gemini_bgr
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    holes = cv2.dilate(holes, kernel, iterations=1)
-    return cv2.inpaint(gemini_bgr, holes, 5, cv2.INPAINT_TELEA)
+    h, w = original_bgr.shape[:2]
+    if gemini_bgr.shape[:2] != (h, w):
+        gemini_bgr = cv2.resize(gemini_bgr, (w, h), interpolation=cv2.INTER_LANCZOS4)
+
+    marker = red_marker_mask(gemini_bgr)
+    gem = gemini_bgr.copy()
+    gem[marker > 0] = 0
+    fg = foreground_mask(gem, person_mask)
+
+    # Marker drawn over the person: patch it from the surrounding person pixels.
+    on_person = cv2.bitwise_and(marker, fg)
+    if cv2.countNonZero(on_person):
+        gem = cv2.inpaint(gem, on_person, 5, cv2.INPAINT_TELEA)
+
+    # Gemini's silhouette edge is blended toward its black background; pasting
+    # it as-is leaves a thin dark outline. Pull the edge in by 2 px (the
+    # original background, or the gap repair, covers the difference).
+    fg = cv2.erode(fg, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+
+    composite = original_bgr.copy()
+    composite[fg > 0] = gem[fg > 0]
+    gap = ((person_mask > 2) & (fg == 0)).astype(np.uint8) * 255
+    composite[gap > 0] = 0
+    return composite, gap

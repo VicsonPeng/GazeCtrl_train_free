@@ -23,9 +23,7 @@ import tkinter as tk
 from model_utils import (
     get_depth_anything,
     load_sam_predictor,
-    remove_red_marker,
-    clean_foreground_mask,
-    inpaint_small_holes,
+    composite_onto_background,
     GEMINI_API_KEY,
     GEMINI_MODEL,
 )
@@ -148,40 +146,18 @@ def paste_back_and_repair(original_bgr, gemini_result, person_mask, out_dir, bas
     2. 讓 Gemini 新生成的圖層完全覆蓋重疊區域（不使用 max，避免數值疊加）。
     3. 送回 Gemini 修補因位移產生的黑色縫隙。
     """
-    h, w = original_bgr.shape[:2]
-    
-    # 1. 尺寸校準
-    if gemini_result.shape[:2] != (h, w):
-        print(f"  [Fix] Resizing Gemini result to {(h, w)}")
-        gemini_result = cv2.resize(gemini_result, (w, h), interpolation=cv2.INTER_LANCZOS4)
+    # 1-4. 清除紅點、取得 Gemini 實際畫出的人物遮罩、貼回原圖。
+    # 舊版以亮度 >20 且只保留最大連通區塊判斷人物，會把深色頭髮/衣服當成背景，
+    # 人物被切成兩塊時（例如被別人的手臂隔開）還會整個頭被丟掉；
+    # 紅點偵測也會誤刪暖色膚色。細節見 model_utils.composite_onto_background。
+    composite_image, gap_mask = composite_onto_background(original_bgr, gemini_result, person_mask)
 
-    # 1b. 清除 Gemini 可能留下的紅點（大幅度姿態變化時，紅點座標不一定跟原本一樣）
-    gemini_result = remove_red_marker(gemini_result)
-
-    # 1c. Gemini 的隔離人像輸出有時會在人物輪廓外散落雜訊噪點，
-    # 或在人物身上（例如臉上）留下極小的近黑色噪點孔洞。
-    # 先清成「只保留最大連通區塊」的乾淨遮罩，並就地修補人物身上的小孔洞，
-    # 避免這些雜訊被誤判為「新主角像素」貼到背景上，或被送進第二階段修補
-    # 導致 Gemini 對整張圖套用不必要的重新編碼／雜訊。
-    new_person_mask = clean_foreground_mask(gemini_result)
-    gemini_result = inpaint_small_holes(gemini_result, new_person_mask)
-    gemini_result[new_person_mask == 0] = 0  # blacken any stray speckle noise outside the cleaned blob
-
-    # 2. 準備「帶洞背景」：先挖掉原本 SAM 抓出的舊位置
-    background_with_hole = original_bgr.copy()
-    background_with_hole[person_mask > 2] = 0
-
-    # 4. 執行覆蓋：
-    # 先把 background 中新主角會佔據的地方也挖空 (避免背景殘留)
-    composite_image = background_with_hole.copy()
-    composite_image[new_person_mask > 0] = 0
-    
-    # 直接加上 gemini_result (因為 composite 對應位置現在是 0，加法等同覆蓋)
-    composite_image = cv2.add(composite_image, gemini_result)
-    
     # 儲存帶縫隙的中間產物供 Debug
     composite_path = str(out_dir / f"{base_name}_composite_unfilled.png")
     cv2.imwrite(composite_path, composite_image)
+    if cv2.countNonZero(gap_mask) == 0:
+        print("  [Path E] Composite created, no gaps to repair.")
+        return composite_image
     print(f"  [Path E] Composite created (Priority: Gemini pixels). Sending to Gemini for final repair...")
 
     # 5. 第二階段：填補黑色區塊 (pixel value 0)
@@ -194,11 +170,9 @@ def paste_back_and_repair(original_bgr, gemini_result, person_mask, out_dir, bas
     # 只取 Gemini 修補的黑色縫隙區域，其餘像素維持 composite_image 原樣。
     # Gemini 的修補回應有時會對整張圖套用輕微的重新編碼/雜訊，如果整張直接採用，
     # 連原本完全不需要修改的區域都會跟著劣化。
-    gap_mask = cv2.inRange(composite_image, (0, 0, 0), (0, 0, 0))
+    # 用合成時算出的 gap_mask，而不是「像素值 == 0」：真正黑色的頭髮/衣服也會是 0。
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     gap_mask = cv2.dilate(gap_mask, kernel, iterations=1)
-    if cv2.countNonZero(gap_mask) == 0:
-        return composite_image
 
     result = composite_image.copy()
     result[gap_mask > 0] = final_output[gap_mask > 0]

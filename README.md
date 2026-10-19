@@ -358,13 +358,20 @@ with an on-screen dot; `plan` reports such infeasible bins.
   inside the person's mask, not an absolute distance.
 - Gemini's "black" isolated-person background is often not exactly (0,0,0) —
   faint compression-like noise can cover a large fraction of it. Both
-  `manual_process_path_e.py` and `dataset_pipeline.py` clean this up before
-  compositing (`model_utils.clean_foreground_mask` / `inpaint_small_holes`):
-  keep only the largest connected foreground blob, patch small internal
-  holes locally, and restrict the final Gemini repair pass to the pixels it
-  actually needed to fill rather than accepting its whole response — earlier
-  versions of this pipeline could otherwise turn a small hole into
-  full-image grain.
+  `manual_process_path_e.py` and `dataset_pipeline.py` composite through
+  `model_utils.composite_onto_background`: a low threshold (max channel > 8)
+  plus blob-size filtering instead of a high threshold, every sizeable blob
+  kept (not only the largest), small enclosed holes filled, the silhouette
+  edge pulled in 2 px to drop Gemini's dark fringe, and an explicit gap mask
+  (old person area − new person) that both repair passes use instead of
+  "pixel == 0", restricting the Gemini repair to those pixels.
+  An earlier version (brightness > 20, largest blob only, HSV hue test for
+  the red dot) blacked out part of the person in 155 of 216 eval outputs:
+  whole heads were dropped when another person's arm split the subject in
+  two, dark hair/clothing became holes, and warm skin was erased as "red
+  marker". The marker is now detected as a compact near-pure-red blob of
+  120–4000 px. `python eval_gt.py recomposite` rebuilds composites from the
+  saved Gemini outputs without API calls.
 
 ## License
 

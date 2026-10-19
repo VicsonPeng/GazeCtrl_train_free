@@ -16,6 +16,8 @@ Workflow (each stage is a subcommand; all state lives under --data):
                Writes Gemini inputs only. No Gemini calls.
   3. run       Sends every planned (or previously failed) candidate to
                Gemini; gap repair uses OpenCV inpaint for screening.
+     recomposite  Rebuilds the composites from saved Gemini outputs (no API
+               calls) — use after a compositing fix.
   4. review    Keyboard UI: y = OK, n = bad, s = skip, b = back, q = quit.
   5. stats     Accepted/pending counts per yaw/pitch bin and per category.
   -> repeat plan/run/review with --round 2, 3, ... until bins are filled.
@@ -63,6 +65,7 @@ from dataset_pipeline import (
     gemini_edit_dual_image,
     composite_and_repair,
     repair_gemini,
+    merge_gap_repair,
 )
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -653,12 +656,38 @@ def run_one(store, cdir, meta):
         store.write_meta(cdir, meta)
         return False
     cv2.imwrite(str(cdir / "05_gemini_raw.png"), raw)
-    composite, final = composite_and_repair(image, raw, mask, "inpaint")
-    cv2.imwrite(str(cdir / "06_composite_unfilled.png"), composite)
-    cv2.imwrite(str(cdir / "07_final_inpaint.png"), final)
+    write_composite(cdir, image, raw, mask)
     meta.update(status="done", error=None, gemini_seconds=round(time.time() - t0, 1))
     store.write_meta(cdir, meta)
     return True
+
+
+def write_composite(cdir, image, raw, mask):
+    composite, final, gap = composite_and_repair(image, raw, mask, "inpaint")
+    cv2.imwrite(str(cdir / "06_composite_unfilled.png"), composite)
+    cv2.imwrite(str(cdir / "06b_gap_mask.png"), gap)
+    cv2.imwrite(str(cdir / "07_final_inpaint.png"), final)
+    for stale in ("08_final_gemini.png",):       # built from an older composite
+        (cdir / stale).unlink(missing_ok=True)
+
+
+def cmd_recomposite(store, args):
+    """Rebuild 06/07 from the saved Gemini output (no API calls), e.g. after a
+    compositing fix."""
+    todo = [(d, m) for d, m in store.candidates()
+            if m["status"] == "done" and (d / "05_gemini_raw.png").exists()
+            and (args.round is None or m["round"] == args.round)]
+    print(f"[Recomposite] {len(todo)} candidate(s).")
+
+    def one(d, m):
+        image, mask, _, _ = store.load_prep_arrays(m["image"])
+        write_composite(d, image, cv2.imread(str(d / "05_gemini_raw.png")), mask)
+
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        for i, fut in enumerate(as_completed([ex.submit(one, d, m) for d, m in todo]), 1):
+            fut.result()
+            if i % 25 == 0 or i == len(todo):
+                print(f"  {i}/{len(todo)}")
 
 
 def cmd_run(store, args):
@@ -888,15 +917,16 @@ def cmd_finalize(store, args):
         if args.yes or input("Proceed? (y/N): ").strip().lower() in ("y", "yes"):
             def repair(d):
                 composite = cv2.imread(str(d / "06_composite_unfilled.png"))
+                gap = cv2.imread(str(d / "06b_gap_mask.png"), cv2.IMREAD_GRAYSCALE)
+                if gap is None:
+                    raise RuntimeError("no 06b_gap_mask.png — run `recomposite` first")
+                if not cv2.countNonZero(gap):
+                    cv2.imwrite(str(d / "08_final_gemini.png"), composite)
+                    return True
                 rep = repair_gemini(composite)
                 if rep is None:
                     return False
-                # Same gap-only merge as dataset_pipeline.composite_and_repair.
-                gap = cv2.inRange(composite, (0, 0, 0), (0, 0, 0))
-                gap = cv2.dilate(gap, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-                out = composite.copy()
-                out[gap > 0] = rep[gap > 0]
-                cv2.imwrite(str(d / "08_final_gemini.png"), out)
+                cv2.imwrite(str(d / "08_final_gemini.png"), merge_gap_repair(composite, rep, gap))
                 return True
 
             with ThreadPoolExecutor(max_workers=args.workers) as ex:
@@ -978,6 +1008,10 @@ def main():
     p.add_argument("--limit", type=int, help="only run the first N (for a trial run)")
     p.add_argument("--yes", action="store_true")
 
+    p = sub.add_parser("recomposite", help="rebuild composites from saved Gemini output (no API)")
+    p.add_argument("--round", type=int)
+    p.add_argument("--workers", type=int, default=6)
+
     p = sub.add_parser("review", help="keyboard review UI")
     p.add_argument("--round", type=int)
     p.add_argument("--images", nargs="+", metavar="STEM")
@@ -992,7 +1026,8 @@ def main():
 
     args = ap.parse_args()
     store = Store(args.data)
-    {"prep": cmd_prep, "plan": cmd_plan, "run": cmd_run, "review": cmd_review,
+    {"prep": cmd_prep, "plan": cmd_plan, "run": cmd_run, "recomposite": cmd_recomposite,
+     "review": cmd_review,
      "stats": cmd_stats, "finalize": cmd_finalize}[args.cmd](store, args)
 
 

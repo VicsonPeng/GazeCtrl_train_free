@@ -39,9 +39,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from model_utils import (
     load_sam_predictor,
     get_depth_anything,
-    remove_red_marker,
-    clean_foreground_mask,
-    inpaint_small_holes,
+    composite_onto_background,
     GEMINI_API_KEY,
     GEMINI_MODEL,
 )
@@ -387,13 +385,25 @@ def repair_gemini(composite_bgr, max_retries=3):
     return None
 
 
-def repair_inpaint(composite_bgr):
-    """OpenCV TELEA inpainting: fill near-black gaps."""
-    gray = cv2.cvtColor(composite_bgr, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, 5, 255, cv2.THRESH_BINARY_INV)
+def repair_inpaint(composite_bgr, gap_mask):
+    """OpenCV TELEA inpainting of the gap pixels."""
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.dilate(mask, kernel, iterations=1)
+    mask = cv2.dilate(gap_mask, kernel, iterations=1)
     return cv2.inpaint(composite_bgr, mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+
+
+def merge_gap_repair(composite_bgr, repaired_bgr, gap_mask):
+    """
+    Only take the gap pixels from a full-image repair; keep everything else
+    pixel-exact from `composite`. Gemini's repair response can otherwise apply
+    a slight re-encode/noise to the whole image, degrading regions that never
+    needed touching.
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    gap = cv2.dilate(gap_mask, kernel, iterations=1)
+    out = composite_bgr.copy()
+    out[gap > 0] = repaired_bgr[gap > 0]
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -401,49 +411,22 @@ def repair_inpaint(composite_bgr):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def composite_and_repair(original_bgr, gemini_result, person_mask, repair_mode):
-    h, w = original_bgr.shape[:2]
-    if gemini_result.shape[:2] != (h, w):
-        gemini_result = cv2.resize(gemini_result, (w, h), interpolation=cv2.INTER_LANCZOS4)
-
-    # Clear any leftover red target-dot pixels (Gemini can relocate/redraw the
-    # marker on large pose changes, so a fixed coordinate can't be trusted).
-    gemini_result = remove_red_marker(gemini_result)
-
-    # Gemini's isolated-person edit sometimes leaves speckle noise outside the
-    # person's silhouette, or tiny near-black dropout pixels inside it (e.g. on
-    # a face). Clean to the largest connected blob, patch small internal holes
-    # locally, and blacken any stray noise outside the blob so it doesn't leak
-    # into the composite or force an unnecessary/noisy full-image repair.
-    new_mask = clean_foreground_mask(gemini_result)
-    gemini_result = inpaint_small_holes(gemini_result, new_mask)
-    gemini_result[new_mask == 0] = 0
-
-    background = original_bgr.copy()
-    background[person_mask > 2] = 0
-
-    composite = background.copy()
-    composite[new_mask > 0] = 0
-    composite = cv2.add(composite, gemini_result)
+    """Returns (composite, final, gap_mask); see model_utils.composite_onto_background."""
+    composite, gap = composite_onto_background(original_bgr, gemini_result, person_mask)
+    if not cv2.countNonZero(gap):
+        return composite, composite.copy(), gap
 
     if repair_mode == "inpaint":
-        final = repair_inpaint(composite)
+        final = repair_inpaint(composite, gap)
     else:
         gemini_repaired = repair_gemini(composite)
         if gemini_repaired is None:
             print("  [Warning] Gemini repair failed — falling back to inpaint.")
-            final = repair_inpaint(composite)
+            final = repair_inpaint(composite, gap)
         else:
-            # Only take the gap pixels Gemini actually needed to fill; keep
-            # everything else pixel-exact from `composite`. Gemini's repair
-            # response can otherwise apply a slight re-encode/noise to the
-            # whole image, degrading regions that never needed touching.
-            gap_mask = cv2.inRange(composite, (0, 0, 0), (0, 0, 0))
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            gap_mask = cv2.dilate(gap_mask, kernel, iterations=1)
-            final = composite.copy()
-            final[gap_mask > 0] = gemini_repaired[gap_mask > 0]
+            final = merge_gap_repair(composite, gemini_repaired, gap)
 
-    return composite, final
+    return composite, final, gap
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -625,10 +608,11 @@ def process_image(image_path, sam_predictor, args):
 
     # ── Step 5: Composite + repair ────────────────────────────────────────────
     print(f"  [5/5] Composite + repair ({args.repair}) ...")
-    composite, final = composite_and_repair(
+    composite, final, gap_mask = composite_and_repair(
         image_bgr, gemini_result, sam_mask, args.repair
     )
     cv2.imwrite(str(out_dir / "06_composite_unfilled.png"), composite)
+    cv2.imwrite(str(out_dir / "06b_gap_mask.png"), gap_mask)
     cv2.imwrite(str(out_dir / "07_final.png"), final)
 
     # ── Metadata ──────────────────────────────────────────────────────────────
@@ -648,6 +632,7 @@ def process_image(image_path, sam_predictor, args):
             "isolated_depth":     "04b_isolated_depth.png",
             "gemini_raw":         "05_gemini_raw.png",
             "composite_unfilled": "06_composite_unfilled.png",
+            "gap_mask":           "06b_gap_mask.png",
             "final":              "07_final.png",
         },
         "image_size":          list(image_bgr.shape[:2]),   # [H, W]
