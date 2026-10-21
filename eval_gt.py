@@ -20,8 +20,9 @@ Workflow (each stage is a subcommand; all state lives under --data):
                calls) — use after a compositing fix.
   4. review    Keyboard UI: y = OK, n = bad, s = skip, b = back, q = quit.
   5. stats     Accepted/pending counts per yaw/pitch bin and per category.
-     gallery   Static HTML overview of every generated candidate
-               (<data>/gallery/index.html), filterable by image/category/bin.
+     gallery   Static HTML view of the dataset (<data>/gallery/index.html):
+               label distribution charts + every candidate's source / result /
+               result with label direction, filterable; defaults to accepted.
   -> repeat plan/run/review with --round 2, 3, ... until bins are filled.
   6. finalize  Re-runs gap repair with Gemini for accepted candidates only,
                then exports final/ with a manifest.
@@ -827,15 +828,6 @@ def cmd_review(store, args):
     st = {}          # current item's editable label + display geometry
     view = {"hide": False}
 
-    def arrow_start(face, target, gap):
-        """Start the arrow outside the head so the eyes stay unobstructed;
-        None if the target itself is within that radius."""
-        v = np.subtract(target, face, dtype=float)
-        n = float(np.hypot(*v))
-        if n <= gap:
-            return None
-        return tuple(int(round(c)) for c in np.add(face, v / n * gap))
-
     def fit(bgr):
         h, w = bgr.shape[:2]
         sc = min(pane_w / w, pane_h / h)
@@ -1090,13 +1082,35 @@ def cmd_stats(store, args):
 GALLERY_HTML = """<!doctype html>
 <html lang="zh-Hant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Eval GT Gallery</title>
+<title>Eval Dataset</title>
 <style>
-:root { --bg:#f6f6f4; --fg:#1d1d1b; --muted:#6b6b66; --card:#fff; --line:#deded8;
-        --ok:#2f7d4a; --bad:#b23b3b; --accent:#2f5d9a; }
+:root {
+  color-scheme: light;
+  --bg:#f6f6f4; --surface:#fcfcfb; --fg:#0b0b0b; --muted:#52514e; --faint:#8a8984;
+  --line:#deded8; --grid:#ebebe6;
+  --s1:#2a78d6; --s2:#eb6834;
+  --ok:#0ca30c; --bad:#d03b3b;
+  --seq-1:#cde2fb; --seq-2:#9ec5f4; --seq-3:#6da7ec; --seq-4:#3987e5; --seq-5:#256abf;
+  --seq-6:#184f95; --seq-7:#0d366b; --ink-lo:#0b0b0b; --ink-hi:#ffffff;
+}
 @media (prefers-color-scheme: dark) {
-  :root { --bg:#181816; --fg:#ecece6; --muted:#9a9a92; --card:#22221f; --line:#3a3a35;
-          --ok:#5fbf7f; --bad:#e07070; --accent:#7fa8e0; } }
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --bg:#141413; --surface:#1a1a19; --fg:#f0efec; --muted:#c3c2b7; --faint:#8f8e86;
+    --line:#383835; --grid:#2a2a28;
+    --s1:#3987e5; --s2:#d95926;
+    --seq-1:#0d366b; --seq-2:#104281; --seq-3:#184f95; --seq-4:#1c5cab; --seq-5:#256abf;
+    --seq-6:#3987e5; --seq-7:#6da7ec; --ink-lo:#f0efec; --ink-hi:#0b0b0b;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg:#141413; --surface:#1a1a19; --fg:#f0efec; --muted:#c3c2b7; --faint:#8f8e86;
+  --line:#383835; --grid:#2a2a28;
+  --s1:#3987e5; --s2:#d95926;
+  --seq-1:#0d366b; --seq-2:#104281; --seq-3:#184f95; --seq-4:#1c5cab; --seq-5:#256abf;
+  --seq-6:#3987e5; --seq-7:#6da7ec; --ink-lo:#f0efec; --ink-hi:#0b0b0b;
+}
 * { box-sizing:border-box; }
 body { margin:0; background:var(--bg); color:var(--fg);
        font:14px/1.45 system-ui, "Noto Sans TC", "Microsoft JhengHei", sans-serif; }
@@ -1104,20 +1118,40 @@ header { position:sticky; top:0; z-index:5; background:var(--bg); border-bottom:
          padding:10px 16px; display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; }
 header h1 { font-size:16px; margin:0 8px 0 0; }
 header label { color:var(--muted); font-size:13px; }
-select { font:inherit; padding:2px 4px; background:var(--card); color:var(--fg);
+select { font:inherit; padding:2px 4px; background:var(--surface); color:var(--fg);
          border:1px solid var(--line); border-radius:4px; }
-#count { color:var(--muted); margin-left:auto; }
-main { padding:12px 16px 40px; }
-details { margin-bottom:14px; }
-summary { cursor:pointer; color:var(--muted); }
-table.cov { border-collapse:collapse; margin-top:8px; font-variant-numeric:tabular-nums; }
-table.cov td, table.cov th { border:1px solid var(--line); padding:3px 7px; text-align:center; font-size:12px; }
-table.cov td { cursor:pointer; }
-table.cov td:hover { outline:2px solid var(--accent); }
+#count { color:var(--muted); margin-left:auto; font-variant-numeric:tabular-nums; }
+main { padding:12px 16px 40px; max-width:1800px; margin:0 auto; }
+.overview { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(0,1fr); gap:12px; margin-bottom:16px; }
+.panel { background:var(--surface); border:1px solid var(--line); border-radius:6px; padding:12px 14px; min-width:0; }
+.panel h2 { font-size:14px; margin:0 0 2px; }
+.panel .sub { color:var(--muted); font-size:12px; margin:0 0 8px; }
+.stack { display:grid; gap:12px; min-width:0; }
+.legend { display:flex; gap:14px; font-size:12px; color:var(--muted); margin-bottom:4px; }
+.legend i { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; vertical-align:middle; }
+svg text { font:11px system-ui, sans-serif; fill:var(--muted); }
+svg .axis { stroke:var(--line); } svg .gridl { stroke:var(--grid); }
+svg .dot { stroke:var(--surface); stroke-width:2; cursor:pointer; }
+svg .dot:hover { stroke:var(--fg); }
+table.heat { border-collapse:separate; border-spacing:2px; width:100%; table-layout:fixed;
+             font-variant-numeric:tabular-nums; }
+table.heat th:first-child { width:38px; }
+table.heat td.s1, table.heat td.s2, table.heat td.s3, table.heat td.s4 { color:var(--ink-lo); }
+table.heat td.s5, table.heat td.s6, table.heat td.s7 { color:var(--ink-hi); }
+table.heat th { font-weight:400; color:var(--muted); font-size:11px; padding:2px; }
+table.heat td { text-align:center; font-size:12px; height:30px; border-radius:4px; cursor:pointer; }
+table.heat td.sel { outline:2px solid var(--fg); }
+table.heat td.zero { color:var(--faint); background:var(--bg); }
+.bars { display:grid; grid-template-columns:auto 1fr auto; gap:4px 8px; align-items:center; font-size:12px; }
+.bars .bar { height:12px; background:var(--s1); border-radius:0 4px 4px 0; }
+.bars .n { color:var(--muted); font-variant-numeric:tabular-nums; }
+#tip { position:fixed; pointer-events:none; z-index:20; background:var(--surface); color:var(--fg);
+       border:1px solid var(--line); border-radius:4px; padding:5px 8px; font-size:12px;
+       box-shadow:0 2px 8px rgba(0,0,0,.15); display:none; white-space:nowrap; }
 #grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(560px, 1fr)); gap:12px; }
-.card { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:8px; }
-.card.ok { border-color:var(--ok); box-shadow:inset 0 0 0 1px var(--ok); }
-.card.bad { opacity:.55; border-color:var(--bad); }
+.card { background:var(--surface); border:1px solid var(--line); border-radius:6px; padding:8px; scroll-margin-top:70px; }
+.card.bad { opacity:.55; }
+.card.flash { outline:3px solid var(--s1); }
 .imgs { display:grid; grid-template-columns:repeat(3, 1fr); gap:4px; }
 .imgs a { display:block; background:#000; border-radius:3px; overflow:hidden; aspect-ratio:3/4; }
 .imgs img { width:100%; height:100%; object-fit:contain; display:block; }
@@ -1126,89 +1160,222 @@ table.cov td:hover { outline:2px solid var(--accent); }
 .meta { margin-top:6px; display:flex; flex-wrap:wrap; gap:4px 12px; align-items:baseline; }
 .meta b { font-size:14px; }
 .tag { font-size:12px; color:var(--muted); }
-.v-ok { color:var(--ok); font-weight:600; } .v-bad { color:var(--bad); font-weight:600; }
-.dial { width:38px; height:38px; flex:none; }
+.pill { font-size:11px; padding:0 6px; border-radius:8px; border:1px solid var(--line); color:var(--muted); }
+.pill i { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:4px; vertical-align:middle; }
+.v-ok { color:var(--fg); } .v-ok::before { content:"✓ "; color:var(--ok); }
+.v-bad { color:var(--fg); } .v-bad::before { content:"✕ "; color:var(--bad); }
+.dial { width:38px; height:38px; flex:none; color:var(--muted); }
+@media (max-width:1100px) { .overview { grid-template-columns:1fr; } }
 @media (max-width:620px) { #grid { grid-template-columns:1fr; } }
 </style></head><body>
 <header>
-  <h1>Eval GT Gallery</h1>
+  <h1>Eval Dataset</h1>
+  <label>Review <select id="f-verdict"></select></label>
   <label>圖片 <select id="f-image"></select></label>
   <label>類別 <select id="f-cat"></select></label>
+  <label>Label <select id="f-src"></select></label>
   <label>Yaw <select id="f-yaw"></select></label>
   <label>Pitch <select id="f-pitch"></select></label>
-  <label>Review <select id="f-verdict"></select></label>
   <label>排序 <select id="f-sort"><option value="image">依圖片</option><option value="bin">依方向</option></select></label>
   <span id="count"></span>
 </header>
 <main>
-  <details><summary>方向分布（已生成數量，點格子可篩選）</summary><div id="cov"></div></details>
+  <div class="overview">
+    <div class="panel">
+      <h2>Gaze label 分布</h2>
+      <p class="sub">每點一個 sample；格線為 yaw / pitch 分格邊界。點一下跳到該 sample。</p>
+      <div class="legend"><span><i style="background:var(--s1)"></i>人工標註</span><span><i style="background:var(--s2)"></i>= 要求的方向</span></div>
+      <svg id="scatter" viewBox="0 0 720 340" width="100%" role="img" aria-label="yaw pitch scatter"></svg>
+    </div>
+    <div class="stack">
+      <div class="panel">
+        <h2>各方向格數量</h2>
+        <p class="sub">點格子篩選該方向，再點一次取消。pitch 超過 ±45° 併入往上 / 往下。</p>
+        <table class="heat" id="heat"></table>
+      </div>
+      <div class="panel">
+        <h2>各類別數量</h2>
+        <div class="bars" id="bars"></div>
+      </div>
+    </div>
+  </div>
   <div id="grid"></div>
 </main>
+<div id="tip"></div>
 <script>
 const DATA = __DATA__;
-const YAWS = __YAWS__, PITCHES = __PITCHES__;
+const YAWS = __YAWS__, PITCHES = __PITCHES__, PITCH_EDGES = __PEDGES__;
+const PITCH_ZH = {down: "往下", level: "水平", up: "往上"};
 const $ = id => document.getElementById(id);
-function opts(sel, items, all) {
+function opts(sel, items, all, def) {
   sel.innerHTML = `<option value="">${all}</option>` +
     items.map(([v, t]) => `<option value="${v}">${t}</option>`).join("");
+  if (def !== undefined) sel.value = def;
 }
+const hasOk = DATA.some(d => d.verdict === "ok");
+opts($("f-verdict"), [["ok", "OK（資料集）"], ["bad", "不 OK"], ["unreviewed", "未 review"]], "全部", hasOk ? "ok" : "");
 opts($("f-image"), [...new Set(DATA.map(d => d.image))].map(v => [v, v]), "全部");
 opts($("f-cat"), [...new Set(DATA.map(d => d.category))].sort().map(v => [v, v]), "全部");
+opts($("f-src"), [["manual", "人工標註"], ["requested", "= 要求的方向"]], "全部");
 opts($("f-yaw"), YAWS.map((y, i) => [i, (y > 0 ? "+" : "") + y + "°"]), "全部");
-opts($("f-pitch"), PITCHES.map((p, i) => [i, p]), "全部");
-opts($("f-verdict"), [["unreviewed", "未 review"], ["ok", "OK"], ["bad", "不 OK"]], "全部");
+opts($("f-pitch"), PITCHES.map((p, i) => [i, PITCH_ZH[p] || p]), "全部");
 
-function dial(yaw, pitch) {
+const tip = $("tip");
+function showTip(e, html) {
+  tip.innerHTML = html; tip.style.display = "block";
+  const x = Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 8);
+  const y = Math.min(e.clientY + 14, innerHeight - tip.offsetHeight - 8);
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+}
+function hideTip() { tip.style.display = "none"; }
+const sgn = v => (v > 0 ? "+" : "") + v.toFixed(0) + "°";
+const srcColor = s => s === "manual" ? "var(--s1)" : "var(--s2)";
+const srcName = s => s === "manual" ? "人工標註" : "= 要求的方向";
+
+function filters() {
+  return { verdict: $("f-verdict").value, image: $("f-image").value, cat: $("f-cat").value,
+           src: $("f-src").value, yaw: $("f-yaw").value, pitch: $("f-pitch").value };
+}
+function match(d, f, skipBin) {
+  return (!f.verdict || (d.verdict || "unreviewed") === f.verdict) &&
+    (!f.image || d.image === f.image) && (!f.cat || d.category === f.cat) &&
+    (!f.src || d.label_source === f.src) &&
+    (skipBin || ((f.yaw === "" || d.bin[0] == f.yaw) && (f.pitch === "" || d.bin[1] == f.pitch)));
+}
+
+function scatter(rows, f) {
+  const W = 720, H = 340, L = 44, R = 12, T = 10, B = 34;
+  const x = v => L + (v + 180) / 360 * (W - L - R);
+  const y = v => T + (90 - Math.max(-90, Math.min(90, v))) / 180 * (H - T - B);
+  let s = "";
+  for (let b = 0; b <= YAWS.length; b++) {
+    const v = -195 + b * 30;
+    if (v >= -180 && v <= 180) s += `<line class="gridl" x1="${x(v)}" x2="${x(v)}" y1="${T}" y2="${H - B}"/>`;
+  }
+  PITCH_EDGES.forEach(v => s += `<line class="gridl" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/>`);
+  if (f.yaw !== "" || f.pitch !== "") {
+    const yc = YAWS[+f.yaw], x0 = f.yaw === "" ? -180 : Math.max(-180, yc - 15), x1 = f.yaw === "" ? 180 : Math.min(180, yc + 15);
+    const lo = +f.pitch === 0 ? -90 : PITCH_EDGES[+f.pitch];
+    const hi = +f.pitch === PITCHES.length - 1 ? 90 : PITCH_EDGES[+f.pitch + 1];
+    const p0 = f.pitch === "" ? -90 : lo, p1 = f.pitch === "" ? 90 : hi;
+    s += `<rect x="${x(x0)}" y="${y(p1)}" width="${x(x1) - x(x0)}" height="${y(p0) - y(p1)}" fill="var(--s1)" fill-opacity=".08" stroke="var(--s1)" stroke-opacity=".5"/>`;
+  }
+  s += `<line class="axis" x1="${L}" x2="${W - R}" y1="${H - B}" y2="${H - B}"/>`;
+  [-180, -90, 0, 90, 180].forEach(v => s += `<text x="${x(v)}" y="${H - B + 15}" text-anchor="${v === -180 ? "start" : v === 180 ? "end" : "middle"}">${v > 0 ? "+" : ""}${v}°</text>`);
+  s += `<text x="${(L + W - R) / 2}" y="${H - 4}" text-anchor="middle">yaw（0 = 朝向鏡頭，±180 = 背對）</text>`;
+  [-90, -45, -15, 15, 45, 90].forEach(v => s += `<text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v > 0 ? "+" : ""}${v}°</text>`);
+  s += `<text transform="translate(11 ${(T + H - B) / 2}) rotate(-90)" text-anchor="middle">pitch</text>`;
+  rows.forEach((d, i) => s += `<circle class="dot" data-i="${i}" cx="${x(d.yaw)}" cy="${y(d.pitch)}" r="4.5" fill="${srcColor(d.label_source)}"/>`);
+  const svg = $("scatter"); svg.innerHTML = s;
+  svg.querySelectorAll(".dot").forEach(c => {
+    const d = rows[+c.dataset.i];
+    c.onmousemove = e => showTip(e, `<b>${d.image} / ${d.cand_id}</b><br>yaw ${sgn(d.yaw)} · pitch ${sgn(d.pitch)}<br>${d.desc}<br>${srcName(d.label_source)}`);
+    c.onmouseleave = hideTip;
+    c.onclick = () => jump(d);
+  });
+}
+
+function heat(rows, f) {
+  const n = {}; rows.forEach(d => { const k = d.bin.join(","); n[k] = (n[k] || 0) + 1; });
+  const max = Math.max(1, ...Object.values(n));
+  let h = "<tr><th></th>" + YAWS.map(v => `<th>${v > 0 ? "+" : ""}${v}</th>`).join("") + "</tr>";
+  for (let p = PITCHES.length - 1; p >= 0; p--) {
+    h += `<tr><th>${PITCH_ZH[PITCHES[p]] || PITCHES[p]}</th>`;
+    YAWS.forEach((_, yb) => {
+      const c = n[yb + "," + p] || 0;
+      const sel = f.yaw === String(yb) && f.pitch === String(p) ? " sel" : "";
+      if (!c) { h += `<td class="zero${sel}" data-y="${yb}" data-p="${p}" data-n="0">0</td>`; return; }
+      const step = 1 + Math.min(6, Math.floor(c / max * 6.999));
+      h += `<td class="s${step}${sel}" data-y="${yb}" data-p="${p}" data-n="${c}" style="background:var(--seq-${step})">${c}</td>`;
+    });
+    h += "</tr>";
+  }
+  const t = $("heat"); t.innerHTML = h;
+  t.querySelectorAll("td").forEach(td => {
+    const yv = YAWS[+td.dataset.y], pn = PITCH_ZH[PITCHES[+td.dataset.p]];
+    td.onmousemove = e => showTip(e, `yaw ${yv > 0 ? "+" : ""}${yv}° ±15° · ${pn}<br>${td.dataset.n} 個 sample`);
+    td.onmouseleave = hideTip;
+    td.onclick = () => {
+      const same = $("f-yaw").value === td.dataset.y && $("f-pitch").value === td.dataset.p;
+      $("f-yaw").value = same ? "" : td.dataset.y; $("f-pitch").value = same ? "" : td.dataset.p;
+      render();
+    };
+  });
+}
+
+function bars(rows) {
+  const n = {}; rows.forEach(d => n[d.category] = (n[d.category] || 0) + 1);
+  const cats = [...new Set(DATA.map(d => d.category))].sort();
+  const max = Math.max(1, ...Object.values(n));
+  $("bars").innerHTML = cats.map(c =>
+    `<span>${c}</span><div><div class="bar" style="width:${(n[c] || 0) / max * 100}%"></div></div><span class="n">${n[c] || 0}</span>`).join("");
+}
+
+function dial(yaw) {
   const r = yaw * Math.PI / 180, x = 19 + 15 * Math.sin(r), y = 19 + 15 * Math.cos(r);
   return `<svg class="dial" viewBox="0 0 38 38" aria-label="top view">
-    <circle cx="19" cy="19" r="17" fill="none" stroke="currentColor" stroke-opacity=".3"/>
-    <rect x="15" y="34" width="8" height="4" fill="currentColor" fill-opacity=".5"/>
-    <line x1="19" y1="19" x2="${x}" y2="${y}" stroke="#d33" stroke-width="3" stroke-linecap="round"/></svg>`;
+    <circle cx="19" cy="19" r="17" fill="none" stroke="currentColor" stroke-opacity=".35"/>
+    <rect x="15" y="34" width="8" height="4" fill="currentColor" fill-opacity=".6"/>
+    <line x1="19" y1="19" x2="${x}" y2="${y}" stroke="${"var(--s1)"}" stroke-width="3" stroke-linecap="round"/></svg>`;
 }
 function card(d) {
   const v = d.verdict === "ok" ? '<span class="v-ok">OK</span>'
           : d.verdict === "bad" ? '<span class="v-bad">不 OK</span>' : '<span class="tag">未 review</span>';
   const im = (t, f) => `<a href="${f}" target="_blank"><img loading="lazy" src="${t}" alt=""></a>`;
-  return `<div class="card ${d.verdict || ""}">
-    <div class="imgs">${im(d.t_src, d.f_src)}${im(d.t_raw, d.f_raw)}${im(d.t_fin, d.f_fin)}</div>
-    <div class="lab"><span>原圖 + 目標方向</span><span>Gemini 輸出</span><span>合成結果 (inpaint)</span></div>
-    <div class="meta">${dial(d.yaw, d.pitch)}
+  return `<div class="card ${d.verdict || ""}" id="c-${d.image}-${d.cand_id}">
+    <div class="imgs">${im(d.t_src, d.f_src)}${im(d.t_fin, d.f_fin)}${im(d.t_lab, d.f_fin)}</div>
+    <div class="lab"><span>原圖</span><span>結果（GT 影像）</span><span>結果 + label 方向</span></div>
+    <div class="meta">${dial(d.yaw)}
       <b>${d.image} / ${d.cand_id}</b><span class="tag">${d.category}</span>
-      <span>yaw ${d.yaw > 0 ? "+" : ""}${d.yaw.toFixed(0)}° · pitch ${d.pitch > 0 ? "+" : ""}${d.pitch.toFixed(0)}°</span>
-      <span class="tag">${d.desc}</span>${d.label_source === "manual" ? '<span class="v-ok">手動 label</span>' : ""}${v}</div></div>`;
+      <span>yaw ${sgn(d.yaw)} · pitch ${sgn(d.pitch)}</span>
+      <span class="tag">${d.desc}</span>
+      <span class="pill"><i style="background:${srcColor(d.label_source)}"></i>${srcName(d.label_source)}</span>${v}</div></div>`;
+}
+function jump(d) {
+  const el = document.getElementById(`c-${d.image}-${d.cand_id}`);
+  if (!el) return;
+  el.scrollIntoView({behavior: "smooth", block: "start"});
+  el.classList.add("flash"); setTimeout(() => el.classList.remove("flash"), 1500);
 }
 function render() {
-  const f = { image: $("f-image").value, cat: $("f-cat").value, yaw: $("f-yaw").value,
-              pitch: $("f-pitch").value, verdict: $("f-verdict").value };
-  let rows = DATA.filter(d =>
-    (!f.image || d.image === f.image) && (!f.cat || d.category === f.cat) &&
-    (f.yaw === "" || d.bin[0] == f.yaw) && (f.pitch === "" || d.bin[1] == f.pitch) &&
-    (!f.verdict || (d.verdict || "unreviewed") === f.verdict));
+  const f = filters();
+  const base = DATA.filter(d => match(d, f, true));
+  let rows = DATA.filter(d => match(d, f, false));
+  scatter(rows, f); heat(base, f); bars(rows);
   if ($("f-sort").value === "bin")
     rows = [...rows].sort((a, b) => a.bin[0] - b.bin[0] || b.bin[1] - a.bin[1] || a.image.localeCompare(b.image));
   $("grid").innerHTML = rows.map(card).join("");
-  $("count").textContent = `${rows.length} / ${DATA.length}`;
-}
-function coverage() {
-  const n = {};
-  DATA.forEach(d => { const k = d.bin.join(","); n[k] = (n[k] || 0) + 1; });
-  let h = '<table class="cov"><tr><th>pitch \\\\ yaw</th>' + YAWS.map(y => `<th>${y}</th>`).join("") + "</tr>";
-  for (let p = PITCHES.length - 1; p >= 0; p--) {
-    h += `<tr><th>${PITCHES[p]}</th>` + YAWS.map((_, y) =>
-      `<td data-y="${y}" data-p="${p}">${n[y + "," + p] || 0}</td>`).join("") + "</tr>";
-  }
-  $("cov").innerHTML = h + "</table>";
-  $("cov").querySelectorAll("td").forEach(td => td.onclick = () => {
-    $("f-yaw").value = td.dataset.y; $("f-pitch").value = td.dataset.p; render(); });
+  $("count").textContent = `${rows.length} / ${DATA.length} 個 sample`;
 }
 document.querySelectorAll("header select").forEach(s => s.onchange = render);
-coverage(); render();
+render();
 </script></body></html>
 """
 
 
+def arrow_start(face, target, gap):
+    """Start a face->target arrow outside the head so the eyes stay
+    unobstructed; None if the target itself is within that radius."""
+    v = np.subtract(target, face, dtype=float)
+    n = float(np.hypot(*v))
+    if n <= gap:
+        return None
+    return tuple(int(round(c)) for c in np.add(face, v / n * gap))
+
+
+def draw_direction(bgr, face, target, gap):
+    out = bgr.copy()
+    lw = max(2, out.shape[1] // 250)
+    a0 = arrow_start(face, target, gap)
+    if a0:
+        cv2.arrowedLine(out, a0, tuple(int(v) for v in target), (0, 230, 255), lw, tipLength=0.06)
+    cv2.circle(out, tuple(int(v) for v in target), 4 * lw, (0, 0, 255), -1)
+    return out
+
+
 def cmd_gallery(store, args):
-    """Write <data>/gallery/index.html with thumbnails of every generated candidate."""
+    """Write <data>/gallery/index.html: label distribution charts plus
+    thumbnails of every generated candidate (defaults to the accepted set)."""
     out = store.root / "gallery"
     thumbs = out / "thumbs"
     thumbs.mkdir(parents=True, exist_ok=True)
@@ -1226,18 +1393,18 @@ def cmd_gallery(store, args):
 
     def one(d, m):
         stem = f"{m['image']}_{m['cand_id']}"
-        t = {k: thumbs / f"{stem}_{k}.jpg" for k in ("src", "raw", "fin")}
+        t = {k: thumbs / f"{stem}_{k}.jpg" for k in ("src", "fin", "lab")}
         fin = d / "07_final_inpaint.png"
+        newest = max(fin.stat().st_mtime, (d / "meta.json").stat().st_mtime)
         if args.redo or not all(p.exists() for p in t.values()) \
-                or t["fin"].stat().st_mtime < fin.stat().st_mtime:
-            src = cv2.imread(str(store.prep / m["image"] / "image.png"))
-            lw = max(2, src.shape[1] // 250)
-            cv2.arrowedLine(src, tuple(m["face_px"]), tuple(m["target_px"]), (0, 230, 255), lw,
-                            tipLength=0.06)
-            cv2.circle(src, tuple(m["target_px"]), 4 * lw, (0, 0, 255), -1)
-            thumb(src, t["src"])
-            thumb(cv2.imread(str(d / "05_gemini_raw.png")), t["raw"])
-            thumb(cv2.imread(str(fin)), t["fin"])
+                or min(p.stat().st_mtime for p in t.values()) < newest:
+            info = store.prep_info(m["image"]) or {}
+            gap = max(25.0, 1.6 * float(info.get("head_r", 40)))
+            lab = label_of(m)
+            result = cv2.imread(str(fin))
+            thumb(cv2.imread(str(store.prep / m["image"] / "image.png")), t["src"])
+            thumb(result, t["fin"])
+            thumb(draw_direction(result, lab["face_px"], lab["target_px"], gap), t["lab"])
         lab = label_of(m)
         g = lab["gaze"]
         rel = lambda p: Path(os.path.relpath(p, out)).as_posix()
@@ -1246,11 +1413,9 @@ def cmd_gallery(store, args):
             "bin": list(label_bin(m)), "yaw": g["yaw_deg"], "pitch": g["pitch_deg"],
             "label_source": lab["source"],
             "desc": describe_gaze(g["yaw_deg"], g["pitch_deg"]),
-            "relation": m["relation"].split(" (")[0],
             "verdict": reviews.get(cand_key(m), {}).get("verdict"),
-            "t_src": rel(t["src"]), "t_raw": rel(t["raw"]), "t_fin": rel(t["fin"]),
-            "f_src": rel(store.prep / m["image"] / "image.png"),
-            "f_raw": rel(d / "05_gemini_raw.png"), "f_fin": rel(fin),
+            "t_src": rel(t["src"]), "t_fin": rel(t["fin"]), "t_lab": rel(t["lab"]),
+            "f_src": rel(store.prep / m["image"] / "image.png"), "f_fin": rel(fin),
         }
 
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
@@ -1259,8 +1424,11 @@ def cmd_gallery(store, args):
     html = (GALLERY_HTML
             .replace("__DATA__", json.dumps(rows, ensure_ascii=False))
             .replace("__YAWS__", json.dumps([yaw_bin_center(b) for b in range(N_YAW_BINS)]))
-            .replace("__PITCHES__", json.dumps(PITCH_NAMES)))
+            .replace("__PITCHES__", json.dumps(PITCH_NAMES))
+            .replace("__PEDGES__", json.dumps(PITCH_EDGES)))
     (out / "index.html").write_text(html, encoding="utf-8")
+    for old in thumbs.glob("*_raw.jpg"):          # thumbnails from the previous layout
+        old.unlink()
     print(f"[Gallery] -> {out / 'index.html'}")
 
 
