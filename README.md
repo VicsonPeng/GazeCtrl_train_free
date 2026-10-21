@@ -323,7 +323,9 @@ python eval_gt.py review --round 1                  # y = OK (+ label), n = bad,
 python eval_gt.py stats                             # accepted count per yaw x pitch bin
 python eval_gt.py gallery                           # HTML overview of everything -> ../eval_dataset/gallery/index.html
 python eval_gt.py plan --round 2 --per-image 4      # next round favours bins that are still empty
-python eval_gt.py finalize                          # Gemini gap repair for accepted only, export final/
+python eval_gt.py label-source                      # label the gaze of the person in each source photo
+python eval_gt.py repair --min-gap-pct 0.2          # Gemini gap repair for accepted only (unrepair ID to revert)
+python eval_gt.py finalize                          # export final/ (no API calls)
 ```
 
 Data lives in `../eval_dataset/` (`raw/` in; `prep/`, `candidates/`,
@@ -352,6 +354,10 @@ next to the requested direction. Accepted candidates store it as
 `meta.json["label"]` with `source` = `requested` (untouched) or `manual`;
 `stats`, `plan`, `gallery` and `finalize` all use this effective label, and
 `final/manifest.*` records `label_source` plus the original request.
+Source photos get their own manual gaze label (`label-source`, same
+controls), exported as `source_dx … source_pitch_deg`. Each exported
+target uses the Gemini gap repair when `repair` produced one and the
+screening inpaint otherwise (`repair` column); `gallery` shows which.
 
 ## Notes & limitations
 

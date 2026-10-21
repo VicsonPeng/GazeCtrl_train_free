@@ -24,8 +24,10 @@ Workflow (each stage is a subcommand; all state lives under --data):
                label distribution charts + every candidate's source / result /
                result with label direction, filterable; defaults to accepted.
   -> repeat plan/run/review with --round 2, 3, ... until bins are filled.
-  6. finalize  Re-runs gap repair with Gemini for accepted candidates only,
-               then exports final/ with a manifest.
+     label-source  Label the gaze of the person in each source photo.
+  6. repair    Gemini gap repair for accepted candidates only (replaces the
+               screening inpaint); `unrepair` reverts individual samples.
+     finalize  Exports final/ with a manifest (no API calls).
 
 Gaze label convention (matches the training-based pipeline, Part II):
   dx > 0 image-right, dy > 0 UP, dz > 0 TOWARD the camera,
@@ -43,6 +45,8 @@ Usage:
     python eval_gt.py run --workers 3
     python eval_gt.py review --round 1
     python eval_gt.py stats
+    python eval_gt.py label-source
+    python eval_gt.py repair --min-gap-pct 0.2
     python eval_gt.py finalize
 """
 
@@ -1033,6 +1037,305 @@ def cmd_review(store, args):
     cmd_stats(store, args)
 
 
+def cmd_label_source(store, args):
+    """
+    Label the gaze of the person in each SOURCE photo (one per prepped image),
+    with the same geometry and controls as `review`:
+      left click/drag = where they look, right click (hold) = face/head,
+      wheel / slider = target distance relative to the face,
+      y = save & next, r = revert to saved, h = hide marks, s = skip, b = back, q = quit.
+    Saved to prep/<image>/prep.json as "source_label".
+    """
+    import tkinter as tk
+    from PIL import Image, ImageTk
+
+    names = store.prepped_names()
+    if args.images:
+        names = [n for n in names if n in set(args.images)]
+    if not args.all:
+        names = [n for n in names if not store.prep_info(n).get("source_label")]
+    if not names:
+        print("[Label source] Nothing to label (use --all to revisit).")
+        return
+    print(f"[Label source] {len(names)} image(s).")
+
+    root = tk.Tk()
+    root.geometry("+0+0")
+    root.title("Source gaze label")
+    scr_w, scr_h = root.winfo_screenwidth(), root.winfo_screenheight()
+    pane_w, pane_h = scr_w - 300, scr_h - 280
+    top = tk.Frame(root)
+    top.pack()
+    canvas = tk.Canvas(top, width=pane_w, height=pane_h, bg="black", cursor="crosshair")
+    canvas.pack(side=tk.LEFT, padx=2)
+    side_panel = tk.Frame(top)
+    side_panel.pack(side=tk.LEFT, padx=6, anchor=tk.N)
+    tk.Label(side_panel, text="Top view (camera at bottom)").pack()
+    dial = tk.Canvas(side_panel, width=220, height=220, bg="white")
+    dial.pack()
+    tk.Label(side_panel, text="Pitch").pack(pady=(10, 0))
+    pbar = tk.Canvas(side_panel, width=220, height=120, bg="white")
+    pbar.pack()
+    tk.Label(side_panel, text="目標距離 ÷ 臉的距離 (log2)").pack(pady=(10, 0))
+    ratio_scale = tk.Scale(side_panel, from_=-2.5, to=2.5, resolution=0.05,
+                           orient=tk.HORIZONTAL, length=220, takefocus=0)
+    ratio_scale.pack()
+    info = tk.Label(side_panel, justify=tk.LEFT, font=("Arial", 11), wraplength=230)
+    info.pack(pady=8)
+    tk.Label(root, font=("Arial", 10), text=(
+        "left click = where they look, right click (hold) = face/head, wheel = distance   |   "
+        "y = save & next   r = revert   h = hide marks   s = skip   b = back   q = quit")).pack(pady=4)
+
+    pos = [0]
+    st = {}
+    view = {"hide": False}
+
+    def ratio_to_depth(lr):
+        return float(np.clip(st["face_depth"] / (2.0 ** lr), 1.0, 255.0))
+
+    def current_gaze():
+        if st.get("target") is None:
+            return None
+        return gaze_from_target(st["face"], st["target"], st["face_depth"], st["depth"],
+                                st["shape"])
+
+    def on_slider(*_):
+        if st and not st.get("loading"):
+            st["depth"] = ratio_to_depth(ratio_scale.get())
+        redraw()
+
+    def redraw(*_):
+        if not st:
+            return
+        sc, ox, oy = st["sc"], st["ox"], st["oy"]
+        canvas.delete("label")
+        if not view["hide"] and st.get("target") is not None:
+            tx, ty = st["target"][0] * sc + ox, st["target"][1] * sc + oy
+            a0 = arrow_start(st["face"], st["target"], st["gap"])
+            if a0:
+                canvas.create_line(a0[0] * sc + ox, a0[1] * sc + oy, tx, ty, fill="#ffd400",
+                                   width=3, arrow=tk.LAST, tags="label")
+            canvas.create_oval(tx - 7, ty - 7, tx + 7, ty + 7, fill="#ff2020", outline="white",
+                               tags="label")
+        if st.get("show_face"):
+            fx, fy = st["face"][0] * sc + ox, st["face"][1] * sc + oy
+            canvas.create_line(fx - 12, fy, fx + 12, fy, fill="#00e5ff", width=2, tags="label")
+            canvas.create_line(fx, fy - 12, fx, fy + 12, fill="#00e5ff", width=2, tags="label")
+
+        g = current_gaze()
+        dial.delete("all")
+        dial.create_oval(20, 20, 200, 200, outline="#999")
+        dial.create_rectangle(98, 204, 122, 216, fill="#333")
+        dial.create_text(110, 12, text="away from camera", font=("Arial", 8))
+        pbar.delete("all")
+        pbar.create_line(20, 60, 200, 60, fill="#999")
+        name = names[pos[0]]
+        saved = (store.prep_info(name) or {}).get("source_label")
+        if g:
+            yaw, pitch = g["yaw_deg"], g["pitch_deg"]
+            dial.create_line(110, 110, 110 + 85 * math.sin(math.radians(yaw)),
+                             110 + 85 * math.cos(math.radians(yaw)),
+                             arrow=tk.LAST, width=4, fill="#d33")
+            pbar.create_line(20, 60, 20 + 180 * math.cos(math.radians(pitch)),
+                             60 - 50 * math.sin(math.radians(pitch)),
+                             arrow=tk.LAST, width=4, fill="#d33")
+            lr = math.log2(st["face_depth"] / st["depth"])
+            r = 2.0 ** lr
+            dist = "與臉同距離" if abs(lr) < 0.08 else \
+                (f"比臉遠 {r:.2f} 倍" if r > 1 else f"比臉近（距離 ×{r:.2f}）")
+            body = (f"yaw {yaw:+.0f}°  pitch {pitch:+.0f}°\n{describe_gaze(yaw, pitch)}\n\n"
+                    f"目標{dist}\n(depth {st['depth']:.1f}, face {st['face_depth']:.0f})")
+        else:
+            body = "左鍵點出他正在看的位置"
+        info.config(text=(f"[{pos[0] + 1}/{len(names)}]\n{name}  ({category_of(name)})\n\n"
+                          f"{body}\n\nsaved: {'yes' if saved else 'no'}"))
+
+    def load(lab):
+        st["face"] = list(lab["face_px"])
+        st["target"] = list(lab["target_px"]) if lab.get("target_px") else None
+        st["depth"] = float(lab.get("target_depth", st["face_depth"]))
+        st["loading"] = True
+        ratio_scale.set(math.log2(st["face_depth"] / max(st["depth"], 1.0)))
+        root.update_idletasks()
+        st["loading"] = False
+
+    def show():
+        name = names[pos[0]]
+        info_ = store.prep_info(name)
+        img = cv2.imread(str(store.prep / name / "image.png"))
+        h, w = img.shape[:2]
+        sc = min(pane_w / w, pane_h / h)
+        disp = cv2.resize(img, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA)
+        tkimg = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)))
+        canvas._img = tkimg
+        canvas.delete("all")
+        canvas.create_image(pane_w // 2, pane_h // 2, image=tkimg)
+        st.clear()
+        st.update(sc=sc, ox=(pane_w - disp.shape[1]) // 2, oy=(pane_h - disp.shape[0]) // 2,
+                  shape=(h, w), face_depth=float(info_["face_depth"]),
+                  gap=max(25.0, 1.6 * float(info_.get("head_r", 40))))
+        load(info_.get("source_label") or {"face_px": info_["face_px"]})
+        redraw()
+        root.title(f"Source gaze label — {name}")
+
+    def to_img(e):
+        h, w = st["shape"]
+        return [int(np.clip((e.x - st["ox"]) / st["sc"], 0, w - 1)),
+                int(np.clip((e.y - st["oy"]) / st["sc"], 0, h - 1))]
+
+    def set_target(e):
+        st["target"] = to_img(e)
+        redraw()
+
+    def set_face(e):
+        st["face"] = to_img(e)
+        st["show_face"] = True
+        redraw()
+
+    def release_face(_):
+        st["show_face"] = False
+        redraw()
+
+    def wheel(e):
+        up = getattr(e, "delta", 0) > 0 or getattr(e, "num", 0) == 4
+        ratio_scale.set(min(2.5, max(-2.5, ratio_scale.get() + (0.05 if up else -0.05))))
+        st["depth"] = ratio_to_depth(ratio_scale.get())
+        redraw()
+
+    def step(delta):
+        pos[0] += delta
+        if pos[0] >= len(names):
+            print("[Label source] Reached the end.")
+            root.destroy()
+            return
+        pos[0] = max(0, pos[0])
+        show()
+
+    def on_key(e):
+        k = e.keysym.lower()
+        name = names[pos[0]]
+        if k == "y":
+            g = current_gaze()
+            if g is None:
+                return
+            info_ = store.prep_info(name)
+            info_["source_label"] = {
+                "face_px": list(st["face"]), "target_px": list(st["target"]),
+                "face_depth": st["face_depth"], "target_depth": st["depth"],
+                "gaze": g, "source": "manual", "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            (store.prep / name / "prep.json").write_text(json.dumps(info_, indent=2),
+                                                         encoding="utf-8")
+            step(1)
+        elif k == "r":
+            info_ = store.prep_info(name)
+            load(info_.get("source_label") or {"face_px": info_["face_px"]})
+            redraw()
+        elif k == "h":
+            view["hide"] = not view["hide"]
+            redraw()
+        elif k == "s":
+            step(1)
+        elif k == "b":
+            step(-1)
+        elif k == "q":
+            root.destroy()
+
+    canvas.bind("<Button-1>", set_target)
+    canvas.bind("<B1-Motion>", set_target)
+    canvas.bind("<Button-3>", set_face)
+    canvas.bind("<B3-Motion>", set_face)
+    canvas.bind("<ButtonRelease-3>", release_face)
+    canvas.bind("<MouseWheel>", wheel)
+    canvas.bind("<Button-4>", wheel)
+    canvas.bind("<Button-5>", wheel)
+    ratio_scale.config(command=on_slider)
+    root.bind("<Key>", on_key)
+    show()
+    root.mainloop()
+    done = sum(1 for n in store.prepped_names() if store.prep_info(n).get("source_label"))
+    print(f"[Label source] {done}/{len(store.prepped_names())} source images labelled.")
+
+
+def accepted_candidates(store):
+    reviews = store.reviews()
+    return [(d, m) for d, m in store.candidates()
+            if reviews.get(cand_key(m), {}).get("verdict") == "ok"]
+
+
+def gt_image(cdir):
+    """The best available target image: Gemini gap repair if done, else inpaint."""
+    g = cdir / "08_final_gemini.png"
+    return (g, "gemini") if g.exists() else (cdir / "07_final_inpaint.png", "inpaint")
+
+
+def cmd_repair(store, args):
+    """Gemini gap repair (replacing the screening inpaint) for accepted candidates."""
+    accepted = accepted_candidates(store)
+    if args.ids:
+        want = set(args.ids)
+        accepted = [(d, m) for d, m in accepted if cand_key(m) in want
+                    or f"{m['image']}_{m['cand_id']}" in want]
+    todo = []
+    small = 0
+    for d, m in accepted:
+        if (d / "08_final_gemini.png").exists() and not args.ids:
+            continue
+        gap = cv2.imread(str(d / "06b_gap_mask.png"), cv2.IMREAD_GRAYSCALE)
+        if gap is None:
+            print(f"  {cand_key(m)}: no 06b_gap_mask.png — run `recomposite` first")
+            continue
+        if cv2.countNonZero(gap) / gap.size * 100 < args.min_gap_pct:
+            small += 1
+            continue
+        todo.append((d, m, gap))
+    if args.limit:
+        todo = todo[:args.limit]
+    print(f"[Repair] {len(todo)} candidate(s) -> {len(todo)} Gemini call(s)"
+          + (f"; {small} below --min-gap-pct {args.min_gap_pct} keep inpaint" if small else ""))
+    if not todo:
+        return
+    if not args.yes and input("Proceed? (y/N): ").strip().lower() not in ("y", "yes"):
+        return
+
+    def one(d, gap):
+        composite = cv2.imread(str(d / "06_composite_unfilled.png"))
+        rep = repair_gemini(composite)
+        if rep is None:
+            return False
+        cv2.imwrite(str(d / "08_final_gemini.png"), merge_gap_repair(composite, rep, gap))
+        return True
+
+    ok = fail = 0
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = {ex.submit(one, d, gap): m for d, m, gap in todo}
+        for i, fut in enumerate(as_completed(futs), 1):
+            m = futs[fut]
+            try:
+                good = fut.result()
+            except Exception as e:
+                print(f"  {cand_key(m)}: {e!r}")
+                good = False
+            ok += good
+            fail += not good
+            print(f"  [{i}/{len(todo)}] {cand_key(m)}: {'repaired' if good else 'FAILED'}")
+    print(f"[Repair] repaired {ok}, failed {fail}. Re-run to retry failures; "
+          "`gallery` shows which image each sample uses.")
+
+
+def cmd_unrepair(store, args):
+    """Drop the Gemini repair for the given samples (they fall back to inpaint)."""
+    want = set(args.ids)
+    n = 0
+    for d, m in store.candidates():
+        if cand_key(m) in want or f"{m['image']}_{m['cand_id']}" in want:
+            p = d / "08_final_gemini.png"
+            if p.exists():
+                p.unlink()
+                n += 1
+    print(f"[Unrepair] removed {n} Gemini repair(s).")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  5. STATS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1174,6 +1477,7 @@ table.heat td.zero { color:var(--faint); background:var(--bg); }
   <label>圖片 <select id="f-image"></select></label>
   <label>類別 <select id="f-cat"></select></label>
   <label>Label <select id="f-src"></select></label>
+  <label>補洞 <select id="f-repair"></select></label>
   <label>Yaw <select id="f-yaw"></select></label>
   <label>Pitch <select id="f-pitch"></select></label>
   <label>排序 <select id="f-sort"><option value="image">依圖片</option><option value="bin">依方向</option></select></label>
@@ -1217,6 +1521,7 @@ opts($("f-verdict"), [["ok", "OK（資料集）"], ["bad", "不 OK"], ["unreview
 opts($("f-image"), [...new Set(DATA.map(d => d.image))].map(v => [v, v]), "全部");
 opts($("f-cat"), [...new Set(DATA.map(d => d.category))].sort().map(v => [v, v]), "全部");
 opts($("f-src"), [["manual", "人工標註"], ["requested", "= 要求的方向"]], "全部");
+opts($("f-repair"), [["gemini", "Gemini"], ["inpaint", "inpaint"]], "全部");
 opts($("f-yaw"), YAWS.map((y, i) => [i, (y > 0 ? "+" : "") + y + "°"]), "全部");
 opts($("f-pitch"), PITCHES.map((p, i) => [i, PITCH_ZH[p] || p]), "全部");
 
@@ -1234,12 +1539,13 @@ const srcName = s => s === "manual" ? "人工標註" : "= 要求的方向";
 
 function filters() {
   return { verdict: $("f-verdict").value, image: $("f-image").value, cat: $("f-cat").value,
-           src: $("f-src").value, yaw: $("f-yaw").value, pitch: $("f-pitch").value };
+           src: $("f-src").value, repair: $("f-repair").value,
+           yaw: $("f-yaw").value, pitch: $("f-pitch").value };
 }
 function match(d, f, skipBin) {
   return (!f.verdict || (d.verdict || "unreviewed") === f.verdict) &&
     (!f.image || d.image === f.image) && (!f.cat || d.category === f.cat) &&
-    (!f.src || d.label_source === f.src) &&
+    (!f.src || d.label_source === f.src) && (!f.repair || d.repair === f.repair) &&
     (skipBin || ((f.yaw === "" || d.bin[0] == f.yaw) && (f.pitch === "" || d.bin[1] == f.pitch)));
 }
 
@@ -1324,12 +1630,13 @@ function card(d) {
   const im = (t, f) => `<a href="${f}" target="_blank"><img loading="lazy" src="${t}" alt=""></a>`;
   return `<div class="card ${d.verdict || ""}" id="c-${d.image}-${d.cand_id}">
     <div class="imgs">${im(d.t_src, d.f_src)}${im(d.t_fin, d.f_fin)}${im(d.t_lab, d.f_fin)}</div>
-    <div class="lab"><span>原圖</span><span>結果（GT 影像）</span><span>結果 + label 方向</span></div>
+    <div class="lab"><span>原圖${d.src_yaw === null ? "（gaze 未標註）" : `（yaw ${sgn(d.src_yaw)} · pitch ${sgn(d.src_pitch)}）`}</span><span>結果（GT 影像）</span><span>結果 + label 方向</span></div>
     <div class="meta">${dial(d.yaw)}
       <b>${d.image} / ${d.cand_id}</b><span class="tag">${d.category}</span>
       <span>yaw ${sgn(d.yaw)} · pitch ${sgn(d.pitch)}</span>
       <span class="tag">${d.desc}</span>
-      <span class="pill"><i style="background:${srcColor(d.label_source)}"></i>${srcName(d.label_source)}</span>${v}</div></div>`;
+      <span class="pill"><i style="background:${srcColor(d.label_source)}"></i>${srcName(d.label_source)}</span>
+      <span class="pill">${d.repair === "gemini" ? "Gemini 補洞" : "inpaint 補洞"}</span>${v}</div></div>`;
 }
 function jump(d) {
   const el = document.getElementById(`c-${d.image}-${d.cand_id}`);
@@ -1394,21 +1701,29 @@ def cmd_gallery(store, args):
     def one(d, m):
         stem = f"{m['image']}_{m['cand_id']}"
         t = {k: thumbs / f"{stem}_{k}.jpg" for k in ("src", "fin", "lab")}
-        fin = d / "07_final_inpaint.png"
-        newest = max(fin.stat().st_mtime, (d / "meta.json").stat().st_mtime)
+        fin, repair = gt_image(d)
+        newest = max(fin.stat().st_mtime, (d / "meta.json").stat().st_mtime,
+                     (store.prep / m["image"] / "prep.json").stat().st_mtime)
         if args.redo or not all(p.exists() for p in t.values()) \
                 or min(p.stat().st_mtime for p in t.values()) < newest:
             info = store.prep_info(m["image"]) or {}
             gap = max(25.0, 1.6 * float(info.get("head_r", 40)))
             lab = label_of(m)
             result = cv2.imread(str(fin))
-            thumb(cv2.imread(str(store.prep / m["image"] / "image.png")), t["src"])
+            src = cv2.imread(str(store.prep / m["image"] / "image.png"))
+            sl = info.get("source_label")
+            if sl:
+                src = draw_direction(src, sl["face_px"], sl["target_px"], gap)
+            thumb(src, t["src"])
             thumb(result, t["fin"])
             thumb(draw_direction(result, lab["face_px"], lab["target_px"], gap), t["lab"])
         lab = label_of(m)
         g = lab["gaze"]
+        sg = ((store.prep_info(m["image"]) or {}).get("source_label") or {}).get("gaze")
         rel = lambda p: Path(os.path.relpath(p, out)).as_posix()
         return {
+            "repair": repair,
+            "src_yaw": sg["yaw_deg"] if sg else None, "src_pitch": sg["pitch_deg"] if sg else None,
             "image": m["image"], "cand_id": m["cand_id"], "category": m["category"],
             "bin": list(label_bin(m)), "yaw": g["yaw_deg"], "pitch": g["pitch_deg"],
             "label_source": lab["source"],
@@ -1437,89 +1752,84 @@ def cmd_gallery(store, args):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def cmd_finalize(store, args):
-    reviews = store.reviews()
-    accepted = [(d, m) for d, m in store.candidates()
-                if reviews.get(cand_key(m), {}).get("verdict") == "ok"]
+    """Export the accepted set to <data>/final/. Each target uses the Gemini gap
+    repair if `repair` produced one, else the screening inpaint; no API calls."""
+    accepted = accepted_candidates(store)
     if not accepted:
         print("[Finalize] No accepted candidates.")
         return
+    if args.require_gemini:
+        before = len(accepted)
+        accepted = [(d, m) for d, m in accepted if gt_image(d)[1] == "gemini"]
+        print(f"[Finalize] --require-gemini: {before - len(accepted)} without Gemini repair left out.")
 
-    need = [(d, m) for d, m in accepted if not (d / "08_final_gemini.png").exists()]
-    if args.repair == "gemini" and need:
-        print(f"[Finalize] {len(need)} accepted candidate(s) need Gemini gap repair "
-              f"({len(need)} Gemini call(s)).")
-        if args.yes or input("Proceed? (y/N): ").strip().lower() in ("y", "yes"):
-            def repair(d):
-                composite = cv2.imread(str(d / "06_composite_unfilled.png"))
-                gap = cv2.imread(str(d / "06b_gap_mask.png"), cv2.IMREAD_GRAYSCALE)
-                if gap is None:
-                    raise RuntimeError("no 06b_gap_mask.png — run `recomposite` first")
-                if not cv2.countNonZero(gap):
-                    cv2.imwrite(str(d / "08_final_gemini.png"), composite)
-                    return True
-                rep = repair_gemini(composite)
-                if rep is None:
-                    return False
-                cv2.imwrite(str(d / "08_final_gemini.png"), merge_gap_repair(composite, rep, gap))
-                return True
-
-            with ThreadPoolExecutor(max_workers=args.workers) as ex:
-                futs = {ex.submit(repair, d): m for d, m in need}
-                for fut in as_completed(futs):
-                    m = futs[fut]
-                    try:
-                        good = fut.result()
-                    except Exception as e:
-                        print(f"  {cand_key(m)}: {e!r}")
-                        good = False
-                    print(f"  {cand_key(m)}: {'repaired' if good else 'FAILED (kept out of export)'}")
+    src_labels = {n: (store.prep_info(n) or {}).get("source_label") for n in store.prepped_names()}
+    no_src = sorted({m["image"] for _, m in accepted if not src_labels.get(m["image"])})
+    if no_src:
+        print(f"[Finalize] WARNING: {len(no_src)} source image(s) have no source gaze label "
+              f"(run `label-source`): {', '.join(no_src)}")
 
     store.final.mkdir(parents=True, exist_ok=True)
-    rows, missing = [], 0
+    rows = []
     for d, m in accepted:
-        tgt_file = "08_final_gemini.png" if args.repair == "gemini" else "07_final_inpaint.png"
-        if not (d / tgt_file).exists():
-            missing += 1
-            continue
+        tgt, repair = gt_image(d)
         sid = f"{m['image']}_{m['cand_id']}"
         out = store.final / sid
         out.mkdir(exist_ok=True)
         for src, dst in ((store.prep / m["image"] / "image.png", "source.png"),
-                         (d / tgt_file, "target.png"),
+                         (tgt, "target.png"),
                          (store.prep / m["image"] / "mask.png", "mask.png")):
             out.joinpath(dst).write_bytes(Path(src).read_bytes())
         lab = label_of(m)
         g = lab["gaze"]
+        sl = src_labels.get(m["image"])
+        sg = sl["gaze"] if sl else {}
         rows.append({
             "sample_id": sid, "image": m["image"], "category": m["category"],
             "cand_id": m["cand_id"], "round": m["round"],
             "dx": g["dx"], "dy": g["dy"], "dz": g["dz"],
             "yaw_deg": g["yaw_deg"], "pitch_deg": g["pitch_deg"],
             "label_source": lab["source"],
+            "source_dx": sg.get("dx"), "source_dy": sg.get("dy"), "source_dz": sg.get("dz"),
+            "source_yaw_deg": sg.get("yaw_deg"), "source_pitch_deg": sg.get("pitch_deg"),
             "face_px": lab["face_px"], "target_px": lab["target_px"],
             "face_depth": lab["face_depth"], "target_depth": lab["target_depth"],
+            "source_label": sl,
             "requested": {"gaze": m["gaze"], "face_px": m["face_px"],
                           "target_px": m["target_px"], "target_depth": m["target_depth"]},
-            "relation": m["relation"], "repair": args.repair, "prompt": m["prompt"],
+            "relation": m["relation"], "repair": repair, "prompt": m["prompt"],
         })
 
+    # Drop sample folders from an earlier export that are no longer accepted.
+    keep = {r["sample_id"] for r in rows}
+    for old in store.final.iterdir():
+        if old.is_dir() and old.name not in keep and (old / "target.png").exists():
+            for f in old.iterdir():
+                f.unlink()
+            old.rmdir()
+
     convention = ("dx>0 image-right, dy>0 up, dz>0 toward camera; "
-                  "yaw=atan2(dx,dz), pitch=asin(dy); label = target direction from face point, "
-                  "target point and depth (Z ~ 1/depth, f = 0.8*width); label_source "
-                  "'requested' = the target Gemini was asked for, 'manual' = set by the "
-                  "reviewer to where the person actually looks")
+                  "yaw=atan2(dx,dz), pitch=asin(dy); gaze = direction from the face point to "
+                  "a target point at a chosen depth (Z ~ 1/depth, f = 0.8*width). "
+                  "dx..pitch_deg = target image gaze; label_source 'requested' = the target "
+                  "Gemini was asked for, 'manual' = set by the reviewer to where the person "
+                  "actually looks. source_* = gaze of the person in source.png, labelled "
+                  "manually the same way. repair = gap fill used for target.png.")
     (store.final / "manifest.json").write_text(json.dumps(
         {"convention": convention, "total": len(rows), "samples": rows},
         indent=2, ensure_ascii=False), encoding="utf-8")
     import csv
     with open(store.final / "manifest.csv", "w", newline="", encoding="utf-8") as fh:
         cols = ["sample_id", "image", "category", "cand_id", "round",
-                "dx", "dy", "dz", "yaw_deg", "pitch_deg", "label_source", "repair"]
+                "dx", "dy", "dz", "yaw_deg", "pitch_deg", "label_source",
+                "source_dx", "source_dy", "source_dz", "source_yaw_deg", "source_pitch_deg",
+                "repair"]
         wr = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
         wr.writeheader()
         wr.writerows(rows)
-    print(f"[Finalize] exported {len(rows)} sample(s) -> {store.final}"
-          + (f"   ({missing} accepted but not repaired yet — re-run finalize)" if missing else ""))
+    n_gem = sum(r["repair"] == "gemini" for r in rows)
+    print(f"[Finalize] exported {len(rows)} sample(s) -> {store.final}  "
+          f"(gap repair: {n_gem} Gemini, {len(rows) - n_gem} inpaint)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1565,16 +1875,33 @@ def main():
     p.add_argument("--workers", type=int, default=6)
     p.add_argument("--redo", action="store_true", help="rebuild all thumbnails")
 
-    p = sub.add_parser("finalize", help="Gemini gap repair for accepted + export")
-    p.add_argument("--repair", choices=["gemini", "inpaint"], default="gemini")
+    p = sub.add_parser("label-source", help="label the gaze of the person in each source photo")
+    p.add_argument("--images", nargs="+", metavar="STEM")
+    p.add_argument("--all", action="store_true", help="include already-labelled images")
+
+    p = sub.add_parser("repair", help="Gemini gap repair for accepted candidates")
+    p.add_argument("--min-gap-pct", type=float, default=0.0,
+                   help="keep inpaint when the gap is below this %% of the image")
+    p.add_argument("--ids", nargs="+", metavar="ID",
+                   help="only these (image/cand or image_cand), re-repairing if done")
+    p.add_argument("--limit", type=int, help="only the first N (for a trial run)")
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--yes", action="store_true")
+
+    p = sub.add_parser("unrepair", help="drop the Gemini repair of some samples (back to inpaint)")
+    p.add_argument("ids", nargs="+", metavar="ID")
+
+    p = sub.add_parser("finalize", help="export the accepted set to final/ (no API calls)")
+    p.add_argument("--require-gemini", action="store_true",
+                   help="leave out samples without a Gemini gap repair")
 
     args = ap.parse_args()
     store = Store(args.data)
     {"prep": cmd_prep, "plan": cmd_plan, "run": cmd_run, "recomposite": cmd_recomposite,
      "review": cmd_review,
-     "stats": cmd_stats, "gallery": cmd_gallery, "finalize": cmd_finalize}[args.cmd](store, args)
+     "stats": cmd_stats, "gallery": cmd_gallery, "label-source": cmd_label_source,
+     "repair": cmd_repair, "unrepair": cmd_unrepair,
+     "finalize": cmd_finalize}[args.cmd](store, args)
 
 
 if __name__ == "__main__":
