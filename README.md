@@ -321,6 +321,7 @@ python eval_gt.py plan --round 1 --per-image 10     # pick targets from the leas
 python eval_gt.py run --workers 3                   # Gemini edit; gap repair = inpaint while screening
 python eval_gt.py review --round 1                  # y = OK, n = bad, s = skip, b = back, q = quit
 python eval_gt.py stats                             # accepted count per yaw x pitch bin
+python eval_gt.py gallery                           # HTML overview of everything -> ../eval_dataset/gallery/index.html
 python eval_gt.py plan --round 2 --per-image 4      # next round favours bins that are still empty
 python eval_gt.py finalize                          # Gemini gap repair for accepted only, export final/
 ```

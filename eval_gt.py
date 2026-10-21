@@ -20,6 +20,8 @@ Workflow (each stage is a subcommand; all state lives under --data):
                calls) — use after a compositing fix.
   4. review    Keyboard UI: y = OK, n = bad, s = skip, b = back, q = quit.
   5. stats     Accepted/pending counts per yaw/pitch bin and per category.
+     gallery   Static HTML overview of every generated candidate
+               (<data>/gallery/index.html), filterable by image/category/bin.
   -> repeat plan/run/review with --round 2, 3, ... until bins are filled.
   6. finalize  Re-runs gap repair with Gemini for accepted candidates only,
                then exports final/ with a manifest.
@@ -43,6 +45,7 @@ Usage:
     python eval_gt.py finalize
 """
 
+import os
 import sys
 import json
 import math
@@ -899,6 +902,185 @@ def cmd_stats(store, args):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  GALLERY  (static HTML overview of everything generated)
+# ══════════════════════════════════════════════════════════════════════════════
+
+GALLERY_HTML = """<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eval GT Gallery</title>
+<style>
+:root { --bg:#f6f6f4; --fg:#1d1d1b; --muted:#6b6b66; --card:#fff; --line:#deded8;
+        --ok:#2f7d4a; --bad:#b23b3b; --accent:#2f5d9a; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#181816; --fg:#ecece6; --muted:#9a9a92; --card:#22221f; --line:#3a3a35;
+          --ok:#5fbf7f; --bad:#e07070; --accent:#7fa8e0; } }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg);
+       font:14px/1.45 system-ui, "Noto Sans TC", "Microsoft JhengHei", sans-serif; }
+header { position:sticky; top:0; z-index:5; background:var(--bg); border-bottom:1px solid var(--line);
+         padding:10px 16px; display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; }
+header h1 { font-size:16px; margin:0 8px 0 0; }
+header label { color:var(--muted); font-size:13px; }
+select { font:inherit; padding:2px 4px; background:var(--card); color:var(--fg);
+         border:1px solid var(--line); border-radius:4px; }
+#count { color:var(--muted); margin-left:auto; }
+main { padding:12px 16px 40px; }
+details { margin-bottom:14px; }
+summary { cursor:pointer; color:var(--muted); }
+table.cov { border-collapse:collapse; margin-top:8px; font-variant-numeric:tabular-nums; }
+table.cov td, table.cov th { border:1px solid var(--line); padding:3px 7px; text-align:center; font-size:12px; }
+table.cov td { cursor:pointer; }
+table.cov td:hover { outline:2px solid var(--accent); }
+#grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(560px, 1fr)); gap:12px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:8px; }
+.card.ok { border-color:var(--ok); box-shadow:inset 0 0 0 1px var(--ok); }
+.card.bad { opacity:.55; border-color:var(--bad); }
+.imgs { display:grid; grid-template-columns:repeat(3, 1fr); gap:4px; }
+.imgs a { display:block; background:#000; border-radius:3px; overflow:hidden; aspect-ratio:3/4; }
+.imgs img { width:100%; height:100%; object-fit:contain; display:block; }
+.lab { display:grid; grid-template-columns:repeat(3, 1fr); gap:4px; color:var(--muted);
+       font-size:11px; text-align:center; margin-top:2px; }
+.meta { margin-top:6px; display:flex; flex-wrap:wrap; gap:4px 12px; align-items:baseline; }
+.meta b { font-size:14px; }
+.tag { font-size:12px; color:var(--muted); }
+.v-ok { color:var(--ok); font-weight:600; } .v-bad { color:var(--bad); font-weight:600; }
+.dial { width:38px; height:38px; flex:none; }
+@media (max-width:620px) { #grid { grid-template-columns:1fr; } }
+</style></head><body>
+<header>
+  <h1>Eval GT Gallery</h1>
+  <label>圖片 <select id="f-image"></select></label>
+  <label>類別 <select id="f-cat"></select></label>
+  <label>Yaw <select id="f-yaw"></select></label>
+  <label>Pitch <select id="f-pitch"></select></label>
+  <label>Review <select id="f-verdict"></select></label>
+  <label>排序 <select id="f-sort"><option value="image">依圖片</option><option value="bin">依方向</option></select></label>
+  <span id="count"></span>
+</header>
+<main>
+  <details><summary>方向分布（已生成數量，點格子可篩選）</summary><div id="cov"></div></details>
+  <div id="grid"></div>
+</main>
+<script>
+const DATA = __DATA__;
+const YAWS = __YAWS__, PITCHES = __PITCHES__;
+const $ = id => document.getElementById(id);
+function opts(sel, items, all) {
+  sel.innerHTML = `<option value="">${all}</option>` +
+    items.map(([v, t]) => `<option value="${v}">${t}</option>`).join("");
+}
+opts($("f-image"), [...new Set(DATA.map(d => d.image))].map(v => [v, v]), "全部");
+opts($("f-cat"), [...new Set(DATA.map(d => d.category))].sort().map(v => [v, v]), "全部");
+opts($("f-yaw"), YAWS.map((y, i) => [i, (y > 0 ? "+" : "") + y + "°"]), "全部");
+opts($("f-pitch"), PITCHES.map((p, i) => [i, p]), "全部");
+opts($("f-verdict"), [["unreviewed", "未 review"], ["ok", "OK"], ["bad", "不 OK"]], "全部");
+
+function dial(yaw, pitch) {
+  const r = yaw * Math.PI / 180, x = 19 + 15 * Math.sin(r), y = 19 + 15 * Math.cos(r);
+  return `<svg class="dial" viewBox="0 0 38 38" aria-label="top view">
+    <circle cx="19" cy="19" r="17" fill="none" stroke="currentColor" stroke-opacity=".3"/>
+    <rect x="15" y="34" width="8" height="4" fill="currentColor" fill-opacity=".5"/>
+    <line x1="19" y1="19" x2="${x}" y2="${y}" stroke="#d33" stroke-width="3" stroke-linecap="round"/></svg>`;
+}
+function card(d) {
+  const v = d.verdict === "ok" ? '<span class="v-ok">OK</span>'
+          : d.verdict === "bad" ? '<span class="v-bad">不 OK</span>' : '<span class="tag">未 review</span>';
+  const im = (t, f) => `<a href="${f}" target="_blank"><img loading="lazy" src="${t}" alt=""></a>`;
+  return `<div class="card ${d.verdict || ""}">
+    <div class="imgs">${im(d.t_src, d.f_src)}${im(d.t_raw, d.f_raw)}${im(d.t_fin, d.f_fin)}</div>
+    <div class="lab"><span>原圖 + 目標方向</span><span>Gemini 輸出</span><span>合成結果 (inpaint)</span></div>
+    <div class="meta">${dial(d.yaw, d.pitch)}
+      <b>${d.image} / ${d.cand_id}</b><span class="tag">${d.category}</span>
+      <span>yaw ${d.yaw > 0 ? "+" : ""}${d.yaw.toFixed(0)}° · pitch ${d.pitch > 0 ? "+" : ""}${d.pitch.toFixed(0)}°</span>
+      <span class="tag">${d.desc}</span><span class="tag">${d.relation}</span>${v}</div></div>`;
+}
+function render() {
+  const f = { image: $("f-image").value, cat: $("f-cat").value, yaw: $("f-yaw").value,
+              pitch: $("f-pitch").value, verdict: $("f-verdict").value };
+  let rows = DATA.filter(d =>
+    (!f.image || d.image === f.image) && (!f.cat || d.category === f.cat) &&
+    (f.yaw === "" || d.bin[0] == f.yaw) && (f.pitch === "" || d.bin[1] == f.pitch) &&
+    (!f.verdict || (d.verdict || "unreviewed") === f.verdict));
+  if ($("f-sort").value === "bin")
+    rows = [...rows].sort((a, b) => a.bin[0] - b.bin[0] || b.bin[1] - a.bin[1] || a.image.localeCompare(b.image));
+  $("grid").innerHTML = rows.map(card).join("");
+  $("count").textContent = `${rows.length} / ${DATA.length}`;
+}
+function coverage() {
+  const n = {};
+  DATA.forEach(d => { const k = d.bin.join(","); n[k] = (n[k] || 0) + 1; });
+  let h = '<table class="cov"><tr><th>pitch \\\\ yaw</th>' + YAWS.map(y => `<th>${y}</th>`).join("") + "</tr>";
+  for (let p = PITCHES.length - 1; p >= 0; p--) {
+    h += `<tr><th>${PITCHES[p]}</th>` + YAWS.map((_, y) =>
+      `<td data-y="${y}" data-p="${p}">${n[y + "," + p] || 0}</td>`).join("") + "</tr>";
+  }
+  $("cov").innerHTML = h + "</table>";
+  $("cov").querySelectorAll("td").forEach(td => td.onclick = () => {
+    $("f-yaw").value = td.dataset.y; $("f-pitch").value = td.dataset.p; render(); });
+}
+document.querySelectorAll("header select").forEach(s => s.onchange = render);
+coverage(); render();
+</script></body></html>
+"""
+
+
+def cmd_gallery(store, args):
+    """Write <data>/gallery/index.html with thumbnails of every generated candidate."""
+    out = store.root / "gallery"
+    thumbs = out / "thumbs"
+    thumbs.mkdir(parents=True, exist_ok=True)
+    reviews = store.reviews()
+    items = [(d, m) for d, m in store.candidates()
+             if m["status"] == "done" and (d / "07_final_inpaint.png").exists()]
+    print(f"[Gallery] {len(items)} candidate(s).")
+
+    def thumb(bgr, path):
+        h, w = bgr.shape[:2]
+        s = args.thumb_height / h
+        cv2.imwrite(str(path), cv2.resize(bgr, (int(w * s), args.thumb_height),
+                                          interpolation=cv2.INTER_AREA),
+                    [cv2.IMWRITE_JPEG_QUALITY, 85])
+
+    def one(d, m):
+        stem = f"{m['image']}_{m['cand_id']}"
+        t = {k: thumbs / f"{stem}_{k}.jpg" for k in ("src", "raw", "fin")}
+        fin = d / "07_final_inpaint.png"
+        if args.redo or not all(p.exists() for p in t.values()) \
+                or t["fin"].stat().st_mtime < fin.stat().st_mtime:
+            src = cv2.imread(str(store.prep / m["image"] / "image.png"))
+            lw = max(2, src.shape[1] // 250)
+            cv2.arrowedLine(src, tuple(m["face_px"]), tuple(m["target_px"]), (0, 230, 255), lw,
+                            tipLength=0.06)
+            cv2.circle(src, tuple(m["target_px"]), 4 * lw, (0, 0, 255), -1)
+            thumb(src, t["src"])
+            thumb(cv2.imread(str(d / "05_gemini_raw.png")), t["raw"])
+            thumb(cv2.imread(str(fin)), t["fin"])
+        g = m["gaze"]
+        rel = lambda p: Path(os.path.relpath(p, out)).as_posix()
+        return {
+            "image": m["image"], "cand_id": m["cand_id"], "category": m["category"],
+            "bin": m["bin"], "yaw": g["yaw_deg"], "pitch": g["pitch_deg"],
+            "desc": describe_gaze(g["yaw_deg"], g["pitch_deg"]),
+            "relation": m["relation"].split(" (")[0],
+            "verdict": reviews.get(cand_key(m), {}).get("verdict"),
+            "t_src": rel(t["src"]), "t_raw": rel(t["raw"]), "t_fin": rel(t["fin"]),
+            "f_src": rel(store.prep / m["image"] / "image.png"),
+            "f_raw": rel(d / "05_gemini_raw.png"), "f_fin": rel(fin),
+        }
+
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        rows = list(ex.map(lambda dm: one(*dm), items))
+    rows.sort(key=lambda r: (r["image"], r["cand_id"]))
+    html = (GALLERY_HTML
+            .replace("__DATA__", json.dumps(rows, ensure_ascii=False))
+            .replace("__YAWS__", json.dumps([yaw_bin_center(b) for b in range(N_YAW_BINS)]))
+            .replace("__PITCHES__", json.dumps(PITCH_NAMES)))
+    (out / "index.html").write_text(html, encoding="utf-8")
+    print(f"[Gallery] -> {out / 'index.html'}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  6. FINALIZE
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1019,6 +1201,11 @@ def main():
 
     sub.add_parser("stats", help="bin coverage summary")
 
+    p = sub.add_parser("gallery", help="static HTML overview of all generated candidates")
+    p.add_argument("--thumb-height", type=int, default=420)
+    p.add_argument("--workers", type=int, default=6)
+    p.add_argument("--redo", action="store_true", help="rebuild all thumbnails")
+
     p = sub.add_parser("finalize", help="Gemini gap repair for accepted + export")
     p.add_argument("--repair", choices=["gemini", "inpaint"], default="gemini")
     p.add_argument("--workers", type=int, default=3)
@@ -1028,7 +1215,7 @@ def main():
     store = Store(args.data)
     {"prep": cmd_prep, "plan": cmd_plan, "run": cmd_run, "recomposite": cmd_recomposite,
      "review": cmd_review,
-     "stats": cmd_stats, "finalize": cmd_finalize}[args.cmd](store, args)
+     "stats": cmd_stats, "gallery": cmd_gallery, "finalize": cmd_finalize}[args.cmd](store, args)
 
 
 if __name__ == "__main__":
