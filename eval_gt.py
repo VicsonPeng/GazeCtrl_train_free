@@ -769,10 +769,13 @@ def cmd_review(store, args):
     requested target, move the label to where the person actually looks
     before accepting:
       left click/drag on the result   = target position
-      right click/drag on the result  = face/head position (in the result)
+      right click/drag on the result  = face/head position (in the result;
+                                        shown only while the button is held)
       mouse wheel or slider           = target distance relative to the face
       y = OK (saves the label)  n = bad  r = reset label to requested
-      s = skip  b = back  q = quit
+      h = hide/show all marks  s = skip  b = back  q = quit
+    No marker is drawn on the face and the arrow starts outside the head, so
+    the eyes stay unobstructed.
     The label uses the same geometry as the requested one (gaze_from_target),
     with the face depth from prep; only the 2D points and the target's
     distance ratio are edited.
@@ -792,8 +795,9 @@ def cmd_review(store, args):
     print(f"[Review] {len(items)} candidate(s).")
 
     root = tk.Tk()
+    root.geometry("+0+0")
     scr_w, scr_h = root.winfo_screenwidth(), root.winfo_screenheight()
-    pane_w, pane_h = (scr_w - 300) // 2, scr_h - 230
+    pane_w, pane_h = (scr_w - 300) // 2, scr_h - 280
     top = tk.Frame(root)
     top.pack()
     c_src = tk.Canvas(top, width=pane_w, height=pane_h, bg="black")
@@ -815,11 +819,22 @@ def cmd_review(store, args):
     info = tk.Label(side_panel, justify=tk.LEFT, font=("Arial", 11), wraplength=230)
     info.pack(pady=8)
     tk.Label(root, font=("Arial", 10), text=(
-        "Result pane: left click = target, right click = face/head, wheel = distance   |   "
-        "y = OK (save label)   n = bad   r = reset label   s = skip   b = back   q = quit")).pack(pady=4)
+        "Result pane: left click = target, right click (hold) = face/head, wheel = distance   |   "
+        "y = OK (save label)   n = bad   r = reset label   h = hide marks   "
+        "s = skip   b = back   q = quit")).pack(pady=4)
 
     pos = [0]
     st = {}          # current item's editable label + display geometry
+    view = {"hide": False}
+
+    def arrow_start(face, target, gap):
+        """Start the arrow outside the head so the eyes stay unobstructed;
+        None if the target itself is within that radius."""
+        v = np.subtract(target, face, dtype=float)
+        n = float(np.hypot(*v))
+        if n <= gap:
+            return None
+        return tuple(int(round(c)) for c in np.add(face, v / n * gap))
 
     def fit(bgr):
         h, w = bgr.shape[:2]
@@ -866,12 +881,18 @@ def cmd_review(store, args):
             return
         sc, ox, oy = st["sc"], st["ox"], st["oy"]
         c_out.delete("label")
-        fx, fy = st["face"][0] * sc + ox, st["face"][1] * sc + oy
-        tx, ty = st["target"][0] * sc + ox, st["target"][1] * sc + oy
-        c_out.create_line(fx, fy, tx, ty, fill="#ffd400", width=3, arrow=tk.LAST, tags="label")
-        c_out.create_oval(fx - 9, fy - 9, fx + 9, fy + 9, outline="#00e5ff", width=3, tags="label")
-        c_out.create_oval(tx - 7, ty - 7, tx + 7, ty + 7, fill="#ff2020", outline="white",
-                          tags="label")
+        if not view["hide"]:
+            tx, ty = st["target"][0] * sc + ox, st["target"][1] * sc + oy
+            a0 = arrow_start(st["face"], st["target"], st["gap"])
+            if a0:
+                c_out.create_line(a0[0] * sc + ox, a0[1] * sc + oy, tx, ty, fill="#ffd400",
+                                  width=3, arrow=tk.LAST, tags="label")
+            c_out.create_oval(tx - 7, ty - 7, tx + 7, ty + 7, fill="#ff2020", outline="white",
+                              tags="label")
+            if st.get("show_face"):        # only while the right button is held
+                fx, fy = st["face"][0] * sc + ox, st["face"][1] * sc + oy
+                c_out.create_line(fx - 12, fy, fx + 12, fy, fill="#00e5ff", width=2, tags="label")
+                c_out.create_line(fx, fy - 12, fx, fy + 12, fill="#00e5ff", width=2, tags="label")
 
         g = current_gaze() or st["requested"]["gaze"]
         dial.delete("all")
@@ -913,16 +934,21 @@ def cmd_review(store, args):
         d, m = items[pos[0]]
         src = cv2.imread(str(store.prep / m["image"] / "image.png"))
         out = cv2.imread(str(d / "07_final_inpaint.png"))
-        lw = max(2, src.shape[1] // 300)
-        cv2.arrowedLine(src, tuple(m["face_px"]), tuple(m["target_px"]), (0, 230, 255), lw,
-                        tipLength=0.05)
-        cv2.circle(src, tuple(m["target_px"]), 4 * lw, (0, 0, 255), -1)
+        info_ = store.prep_info(m["image"]) or {}
+        gap = max(25.0, 1.6 * float(info_.get("head_r", 40)))
+        if not view["hide"]:
+            lw = max(2, src.shape[1] // 300)
+            a0 = arrow_start(m["face_px"], m["target_px"], gap)
+            if a0:
+                cv2.arrowedLine(src, a0, tuple(m["target_px"]), (0, 230, 255), lw,
+                                tipLength=0.05)
+            cv2.circle(src, tuple(m["target_px"]), 4 * lw, (0, 0, 255), -1)
         put(c_src, fit(src)[0])
         disp, sc = fit(out)
         put(c_out, disp)
         st.clear()
         st.update(sc=sc, ox=(pane_w - disp.shape[1]) // 2, oy=(pane_h - disp.shape[0]) // 2,
-                  shape=out.shape[:2], face_depth=float(m["face_depth"]),
+                  shape=out.shape[:2], face_depth=float(m["face_depth"]), gap=gap,
                   requested=label_of({k: v for k, v in m.items() if k != "label"}))
         load_label(label_of(m))
         redraw_label()
@@ -939,6 +965,11 @@ def cmd_review(store, args):
 
     def set_face(e):
         st["face"] = to_img(e)
+        st["show_face"] = True
+        redraw_label()
+
+    def release_face(_):
+        st["show_face"] = False
         redraw_label()
 
     def wheel(e):
@@ -981,6 +1012,13 @@ def cmd_review(store, args):
         elif k == "r":
             load_label(st["requested"])
             redraw_label()
+        elif k == "h":
+            view["hide"] = not view["hide"]
+            keep = {"face_px": list(st["face"]), "target_px": list(st["target"]),
+                    "target_depth": st["depth"]}
+            show()
+            load_label(keep)
+            redraw_label()
         elif k == "s":
             step(1)
         elif k == "b":
@@ -992,6 +1030,7 @@ def cmd_review(store, args):
     c_out.bind("<B1-Motion>", set_target)
     c_out.bind("<Button-3>", set_face)
     c_out.bind("<B3-Motion>", set_face)
+    c_out.bind("<ButtonRelease-3>", release_face)
     c_out.bind("<MouseWheel>", wheel)
     c_out.bind("<Button-4>", wheel)
     c_out.bind("<Button-5>", wheel)
