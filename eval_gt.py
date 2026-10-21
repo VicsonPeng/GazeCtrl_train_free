@@ -556,7 +556,7 @@ def bin_counts(store, reviews):
     acc, pend = {}, {}
     per_img = {}
     for _, meta in store.candidates():
-        b = tuple(meta["bin"])
+        b = label_bin(meta)
         v = reviews.get(cand_key(meta), {}).get("verdict")
         if v == "bad":
             continue
@@ -744,7 +744,39 @@ def describe_gaze(yaw, pitch):
     return f"{facing}，{vert}"
 
 
+def label_of(meta):
+    """The gaze label a candidate carries: the reviewer's manual label if one
+    was saved in review, otherwise the requested target."""
+    if meta.get("label"):
+        return meta["label"]
+    return {"face_px": meta["face_px"], "target_px": meta["target_px"],
+            "face_depth": meta["face_depth"], "target_depth": meta["target_depth"],
+            "gaze": meta["gaze"], "source": "requested"}
+
+
+def label_bin(meta):
+    """Bin of the effective label; pitch outside the bin range is clamped to
+    the nearest pitch bin so manually labelled extremes still count."""
+    g = label_of(meta)["gaze"]
+    pitch = min(max(g["pitch_deg"], PITCH_EDGES[0]), PITCH_EDGES[-1])
+    return bin_key(g["yaw_deg"], pitch)
+
+
 def cmd_review(store, args):
+    """
+    Review + relabel. The result pane shows the candidate's gaze label (face
+    point -> target dot); if the generated gaze is good but doesn't match the
+    requested target, move the label to where the person actually looks
+    before accepting:
+      left click/drag on the result   = target position
+      right click/drag on the result  = face/head position (in the result)
+      mouse wheel or slider           = target distance relative to the face
+      y = OK (saves the label)  n = bad  r = reset label to requested
+      s = skip  b = back  q = quit
+    The label uses the same geometry as the requested one (gaze_from_target),
+    with the face depth from prep; only the 2D points and the target's
+    distance ratio are edited.
+    """
     import tkinter as tk
     from PIL import Image, ImageTk
 
@@ -761,39 +793,121 @@ def cmd_review(store, args):
 
     root = tk.Tk()
     scr_w, scr_h = root.winfo_screenwidth(), root.winfo_screenheight()
-    pane_w, pane_h = (scr_w - 300) // 2, scr_h - 200
+    pane_w, pane_h = (scr_w - 300) // 2, scr_h - 230
     top = tk.Frame(root)
     top.pack()
     c_src = tk.Canvas(top, width=pane_w, height=pane_h, bg="black")
-    c_out = tk.Canvas(top, width=pane_w, height=pane_h, bg="black")
+    c_out = tk.Canvas(top, width=pane_w, height=pane_h, bg="black", cursor="crosshair")
     side_panel = tk.Frame(top)
     c_src.pack(side=tk.LEFT, padx=2)
     c_out.pack(side=tk.LEFT, padx=2)
     side_panel.pack(side=tk.LEFT, padx=6, anchor=tk.N)
-    tk.Label(side_panel, text="Top view (camera at bottom)").pack()
+    tk.Label(side_panel, text="Top view (camera at bottom)\nred = label, grey = requested").pack()
     dial = tk.Canvas(side_panel, width=220, height=220, bg="white")
     dial.pack()
     tk.Label(side_panel, text="Pitch").pack(pady=(10, 0))
     pbar = tk.Canvas(side_panel, width=220, height=120, bg="white")
     pbar.pack()
+    tk.Label(side_panel, text="目標距離 ÷ 臉的距離 (log2)").pack(pady=(10, 0))
+    ratio_scale = tk.Scale(side_panel, from_=-2.5, to=2.5, resolution=0.05,
+                           orient=tk.HORIZONTAL, length=220, takefocus=0)
+    ratio_scale.pack()
     info = tk.Label(side_panel, justify=tk.LEFT, font=("Arial", 11), wraplength=230)
     info.pack(pady=8)
     tk.Label(root, font=("Arial", 10), text=(
-        "y = OK   n = bad   s = skip   b = back   q = quit      "
-        "Left: source (yellow arrow = face -> requested target)   Right: result")).pack(pady=4)
+        "Result pane: left click = target, right click = face/head, wheel = distance   |   "
+        "y = OK (save label)   n = bad   r = reset label   s = skip   b = back   q = quit")).pack(pady=4)
 
     pos = [0]
+    st = {}          # current item's editable label + display geometry
 
-    def fit(bgr, cw, ch):
+    def fit(bgr):
         h, w = bgr.shape[:2]
-        s = min(cw / w, ch / h)
-        return cv2.resize(bgr, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+        sc = min(pane_w / w, pane_h / h)
+        return cv2.resize(bgr, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA), sc
 
     def put(canvas, bgr):
         img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)))
         canvas._img = img
         canvas.delete("all")
         canvas.create_image(pane_w // 2, pane_h // 2, image=img)
+
+    def ratio_to_depth(log2_ratio):
+        return float(np.clip(st["face_depth"] / (2.0 ** log2_ratio), 1.0, 255.0))
+
+    def current_gaze():
+        return gaze_from_target(st["face"], st["target"], st["face_depth"], st["depth"],
+                                st["shape"])
+
+    def edited():
+        req = st["requested"]
+        return (list(st["face"]) != list(req["face_px"])
+                or list(st["target"]) != list(req["target_px"])
+                or abs(st["depth"] - float(req["target_depth"])) > 1e-6)
+
+    def on_slider(*_):
+        # The slider is quantised (0.05 in log2), so it only overrides the
+        # stored depth once the user actually moves it.
+        if st and not st.get("loading"):
+            st["depth"] = ratio_to_depth(ratio_scale.get())
+        redraw_label()
+
+    def draw_dir(g, color, width):
+        yaw, pitch = g["yaw_deg"], g["pitch_deg"]
+        dial.create_line(110, 110, 110 + 85 * math.sin(math.radians(yaw)),
+                         110 + 85 * math.cos(math.radians(yaw)),
+                         arrow=tk.LAST, width=width, fill=color)
+        pbar.create_line(20, 60, 20 + 180 * math.cos(math.radians(pitch)),
+                         60 - 50 * math.sin(math.radians(pitch)),
+                         arrow=tk.LAST, width=width, fill=color)
+
+    def redraw_label(*_):
+        if not st:
+            return
+        sc, ox, oy = st["sc"], st["ox"], st["oy"]
+        c_out.delete("label")
+        fx, fy = st["face"][0] * sc + ox, st["face"][1] * sc + oy
+        tx, ty = st["target"][0] * sc + ox, st["target"][1] * sc + oy
+        c_out.create_line(fx, fy, tx, ty, fill="#ffd400", width=3, arrow=tk.LAST, tags="label")
+        c_out.create_oval(fx - 9, fy - 9, fx + 9, fy + 9, outline="#00e5ff", width=3, tags="label")
+        c_out.create_oval(tx - 7, ty - 7, tx + 7, ty + 7, fill="#ff2020", outline="white",
+                          tags="label")
+
+        g = current_gaze() or st["requested"]["gaze"]
+        dial.delete("all")
+        dial.create_oval(20, 20, 200, 200, outline="#999")
+        dial.create_rectangle(98, 204, 122, 216, fill="#333")          # camera
+        dial.create_text(110, 12, text="away from camera", font=("Arial", 8))
+        pbar.delete("all")
+        pbar.create_line(20, 60, 200, 60, fill="#999")
+        draw_dir(st["requested"]["gaze"], "#bbb", 3)
+        draw_dir(g, "#d33", 4)
+
+        lr = math.log2(st["face_depth"] / st["depth"])
+        r = 2.0 ** lr
+        dist = "與臉同距離" if abs(lr) < 0.08 else \
+            (f"比臉遠 {r:.2f} 倍" if r > 1 else f"比臉近（距離 ×{r:.2f}）")
+        m = items[pos[0]][1]
+        verdict = reviews.get(cand_key(m), {}).get("verdict", "—")
+        rq = st["requested"]["gaze"]
+        info.config(text=(
+            f"[{pos[0] + 1}/{len(items)}]\n{m['image']} / {m['cand_id']}\n"
+            f"category: {m['category']}\n\n"
+            f"label      yaw {g['yaw_deg']:+.0f}°  pitch {g['pitch_deg']:+.0f}°\n"
+            f"{describe_gaze(g['yaw_deg'], g['pitch_deg'])}\n"
+            f"requested  yaw {rq['yaw_deg']:+.0f}°  pitch {rq['pitch_deg']:+.0f}°\n\n"
+            f"目標{dist}\n(depth {st['depth']:.1f}, face {st['face_depth']:.0f})\n\n"
+            f"label: {'已修改' if edited() else '= requested'}\n"
+            f"verdict: {verdict}"))
+
+    def load_label(lab):
+        st["face"] = list(lab["face_px"])
+        st["target"] = list(lab["target_px"])
+        st["depth"] = float(lab["target_depth"])
+        st["loading"] = True
+        ratio_scale.set(math.log2(st["face_depth"] / max(st["depth"], 1.0)))
+        root.update_idletasks()
+        st["loading"] = False
 
     def show():
         d, m = items[pos[0]]
@@ -803,31 +917,35 @@ def cmd_review(store, args):
         cv2.arrowedLine(src, tuple(m["face_px"]), tuple(m["target_px"]), (0, 230, 255), lw,
                         tipLength=0.05)
         cv2.circle(src, tuple(m["target_px"]), 4 * lw, (0, 0, 255), -1)
-        put(c_src, fit(src, pane_w, pane_h))
-        put(c_out, fit(out, pane_w, pane_h))
-
-        g = m["gaze"]
-        yaw, pitch = g["yaw_deg"], g["pitch_deg"]
-        dial.delete("all")
-        dial.create_oval(20, 20, 200, 200, outline="#999")
-        dial.create_rectangle(98, 204, 122, 216, fill="#333")          # camera
-        dial.create_text(110, 12, text="away from camera", font=("Arial", 8))
-        ex = 110 + 85 * math.sin(math.radians(yaw))
-        ey = 110 + 85 * math.cos(math.radians(yaw))
-        dial.create_line(110, 110, ex, ey, arrow=tk.LAST, width=4, fill="#d33")
-        pbar.delete("all")
-        pbar.create_line(20, 60, 200, 60, fill="#999")
-        px_ = 20 + 180 * math.cos(math.radians(pitch))
-        py_ = 60 - 50 * math.sin(math.radians(pitch))
-        pbar.create_line(20, 60, px_, py_, arrow=tk.LAST, width=4, fill="#d33")
-        verdict = reviews.get(cand_key(m), {}).get("verdict", "—")
-        info.config(text=(
-            f"[{pos[0] + 1}/{len(items)}]\n{m['image']} / {m['cand_id']}\n"
-            f"category: {m['category']}\n\n"
-            f"yaw   {yaw:+.0f}°\npitch {pitch:+.0f}°\n{describe_gaze(yaw, pitch)}\n\n"
-            f"target depth {m['target_depth']} vs face {m['face_depth']:.0f}\n"
-            f"({m['relation']})\n\nverdict: {verdict}"))
+        put(c_src, fit(src)[0])
+        disp, sc = fit(out)
+        put(c_out, disp)
+        st.clear()
+        st.update(sc=sc, ox=(pane_w - disp.shape[1]) // 2, oy=(pane_h - disp.shape[0]) // 2,
+                  shape=out.shape[:2], face_depth=float(m["face_depth"]),
+                  requested=label_of({k: v for k, v in m.items() if k != "label"}))
+        load_label(label_of(m))
+        redraw_label()
         root.title(f"Review — {cand_key(m)}")
+
+    def to_img(e):
+        h, w = st["shape"]
+        return [int(np.clip((e.x - st["ox"]) / st["sc"], 0, w - 1)),
+                int(np.clip((e.y - st["oy"]) / st["sc"], 0, h - 1))]
+
+    def set_target(e):
+        st["target"] = to_img(e)
+        redraw_label()
+
+    def set_face(e):
+        st["face"] = to_img(e)
+        redraw_label()
+
+    def wheel(e):
+        up = getattr(e, "delta", 0) > 0 or getattr(e, "num", 0) == 4
+        ratio_scale.set(min(2.5, max(-2.5, ratio_scale.get() + (0.05 if up else -0.05))))
+        st["depth"] = ratio_to_depth(ratio_scale.get())
+        redraw_label()
 
     def step(delta):
         pos[0] += delta
@@ -840,12 +958,29 @@ def cmd_review(store, args):
 
     def on_key(e):
         k = e.keysym.lower()
-        m = items[pos[0]][1]
-        if k in ("y", "n"):
-            reviews[cand_key(m)] = {"verdict": "ok" if k == "y" else "bad",
-                                    "time": time.strftime("%Y-%m-%d %H:%M:%S")}
+        d, m = items[pos[0]]
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        if k == "y":
+            g = current_gaze()
+            if g is None:
+                return
+            m["label"] = {
+                "face_px": list(st["face"]), "target_px": list(st["target"]),
+                "face_depth": st["face_depth"],
+                "target_depth": st["depth"],
+                "gaze": g, "source": "manual" if edited() else "requested", "time": now,
+            }
+            store.write_meta(d, m)
+            reviews[cand_key(m)] = {"verdict": "ok", "time": now}
             store.save_reviews(reviews)
             step(1)
+        elif k == "n":
+            reviews[cand_key(m)] = {"verdict": "bad", "time": now}
+            store.save_reviews(reviews)
+            step(1)
+        elif k == "r":
+            load_label(st["requested"])
+            redraw_label()
         elif k == "s":
             step(1)
         elif k == "b":
@@ -853,6 +988,14 @@ def cmd_review(store, args):
         elif k == "q":
             root.destroy()
 
+    c_out.bind("<Button-1>", set_target)
+    c_out.bind("<B1-Motion>", set_target)
+    c_out.bind("<Button-3>", set_face)
+    c_out.bind("<B3-Motion>", set_face)
+    c_out.bind("<MouseWheel>", wheel)
+    c_out.bind("<Button-4>", wheel)
+    c_out.bind("<Button-5>", wheel)
+    ratio_scale.config(command=on_slider)
     root.bind("<Key>", on_key)
     show()
     root.mainloop()
@@ -993,7 +1136,7 @@ function card(d) {
     <div class="meta">${dial(d.yaw, d.pitch)}
       <b>${d.image} / ${d.cand_id}</b><span class="tag">${d.category}</span>
       <span>yaw ${d.yaw > 0 ? "+" : ""}${d.yaw.toFixed(0)}° · pitch ${d.pitch > 0 ? "+" : ""}${d.pitch.toFixed(0)}°</span>
-      <span class="tag">${d.desc}</span><span class="tag">${d.relation}</span>${v}</div></div>`;
+      <span class="tag">${d.desc}</span>${d.label_source === "manual" ? '<span class="v-ok">手動 label</span>' : ""}${v}</div></div>`;
 }
 function render() {
   const f = { image: $("f-image").value, cat: $("f-cat").value, yaw: $("f-yaw").value,
@@ -1056,11 +1199,13 @@ def cmd_gallery(store, args):
             thumb(src, t["src"])
             thumb(cv2.imread(str(d / "05_gemini_raw.png")), t["raw"])
             thumb(cv2.imread(str(fin)), t["fin"])
-        g = m["gaze"]
+        lab = label_of(m)
+        g = lab["gaze"]
         rel = lambda p: Path(os.path.relpath(p, out)).as_posix()
         return {
             "image": m["image"], "cand_id": m["cand_id"], "category": m["category"],
-            "bin": m["bin"], "yaw": g["yaw_deg"], "pitch": g["pitch_deg"],
+            "bin": list(label_bin(m)), "yaw": g["yaw_deg"], "pitch": g["pitch_deg"],
+            "label_source": lab["source"],
             "desc": describe_gaze(g["yaw_deg"], g["pitch_deg"]),
             "relation": m["relation"].split(" (")[0],
             "verdict": reviews.get(cand_key(m), {}).get("verdict"),
@@ -1136,26 +1281,33 @@ def cmd_finalize(store, args):
                          (d / tgt_file, "target.png"),
                          (store.prep / m["image"] / "mask.png", "mask.png")):
             out.joinpath(dst).write_bytes(Path(src).read_bytes())
-        g = m["gaze"]
+        lab = label_of(m)
+        g = lab["gaze"]
         rows.append({
             "sample_id": sid, "image": m["image"], "category": m["category"],
             "cand_id": m["cand_id"], "round": m["round"],
             "dx": g["dx"], "dy": g["dy"], "dz": g["dz"],
             "yaw_deg": g["yaw_deg"], "pitch_deg": g["pitch_deg"],
-            "face_px": m["face_px"], "target_px": m["target_px"],
-            "face_depth": m["face_depth"], "target_depth": m["target_depth"],
+            "label_source": lab["source"],
+            "face_px": lab["face_px"], "target_px": lab["target_px"],
+            "face_depth": lab["face_depth"], "target_depth": lab["target_depth"],
+            "requested": {"gaze": m["gaze"], "face_px": m["face_px"],
+                          "target_px": m["target_px"], "target_depth": m["target_depth"]},
             "relation": m["relation"], "repair": args.repair, "prompt": m["prompt"],
         })
 
     convention = ("dx>0 image-right, dy>0 up, dz>0 toward camera; "
-                  "yaw=atan2(dx,dz), pitch=asin(dy); label = requested target direction")
+                  "yaw=atan2(dx,dz), pitch=asin(dy); label = target direction from face point, "
+                  "target point and depth (Z ~ 1/depth, f = 0.8*width); label_source "
+                  "'requested' = the target Gemini was asked for, 'manual' = set by the "
+                  "reviewer to where the person actually looks")
     (store.final / "manifest.json").write_text(json.dumps(
         {"convention": convention, "total": len(rows), "samples": rows},
         indent=2, ensure_ascii=False), encoding="utf-8")
     import csv
     with open(store.final / "manifest.csv", "w", newline="", encoding="utf-8") as fh:
         cols = ["sample_id", "image", "category", "cand_id", "round",
-                "dx", "dy", "dz", "yaw_deg", "pitch_deg", "repair"]
+                "dx", "dy", "dz", "yaw_deg", "pitch_deg", "label_source", "repair"]
         wr = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
         wr.writeheader()
         wr.writerows(rows)

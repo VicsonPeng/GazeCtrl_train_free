@@ -319,7 +319,7 @@ isolated-person / final / background images into a flat structure, and writes
 python eval_gt.py prep                              # per photo: SAM mask + click the face (eye midpoint)
 python eval_gt.py plan --round 1 --per-image 10     # pick targets from the least-filled bins (no API calls)
 python eval_gt.py run --workers 3                   # Gemini edit; gap repair = inpaint while screening
-python eval_gt.py review --round 1                  # y = OK, n = bad, s = skip, b = back, q = quit
+python eval_gt.py review --round 1                  # y = OK (+ label), n = bad, r = reset label, s/b/q
 python eval_gt.py stats                             # accepted count per yaw x pitch bin
 python eval_gt.py gallery                           # HTML overview of everything -> ../eval_dataset/gallery/index.html
 python eval_gt.py plan --round 2 --per-image 4      # next round favours bins that are still empty
@@ -341,6 +341,17 @@ contradict e.g. yaw 110°), and judges in front / behind from the depth ratio
 rather than an absolute ±30 difference, which mislabels distant people.
 Close-up faces near the image centre can't express near-frontal directions
 with an on-screen dot; `plan` reports such infeasible bins.
+
+Gemini often produces a good edit that doesn't land exactly on the requested
+target. Rather than discard it, `review` lets the reviewer relabel it on the
+result image before accepting: left click = target, right click = face/head
+position in the result, mouse wheel / slider = target distance as a log2
+ratio to the face's distance (converted to a depth value with the face depth
+from `prep`). The label is recomputed live with the same geometry and shown
+next to the requested direction. Accepted candidates store it as
+`meta.json["label"]` with `source` = `requested` (untouched) or `manual`;
+`stats`, `plan`, `gallery` and `finalize` all use this effective label, and
+`final/manifest.*` records `label_source` plus the original request.
 
 ## Notes & limitations
 
