@@ -325,7 +325,7 @@ python eval_gt.py gallery                           # HTML overview of everythin
 python eval_gt.py plan --round 2 --per-image 4      # next round favours bins that are still empty
 python eval_gt.py label-source                      # label the gaze of the person in each source photo
 python eval_gt.py repair --min-gap-pct 0.2          # Gemini gap repair for accepted only (unrepair ID to revert)
-python eval_gt.py finalize                          # export final/ (no API calls)
+python eval_gt.py finalize                          # export final/ as scenes of labelled views (no API calls)
 ```
 
 Data lives in `../eval_dataset/` (`raw/` in; `prep/`, `candidates/`,
@@ -355,9 +355,14 @@ next to the requested direction. Accepted candidates store it as
 `stats`, `plan`, `gallery` and `finalize` all use this effective label, and
 `final/manifest.*` records `label_source` plus the original request.
 Source photos get their own manual gaze label (`label-source`, same
-controls), exported as `source_dx … source_pitch_deg`. Each exported
-target uses the Gemini gap repair when `repair` produced one and the
-screening inpaint otherwise (`repair` column); `gallery` shows which.
+controls). `finalize` exports scenes, not (source, target) pairs: each
+photo becomes `final/<image>/views/{orig,<cand>}.png` + `masks/…`, every
+view with its own gaze label, so any two views of a scene form a pair in
+either direction. `views.csv` lists views (`kind` = original / generated,
+`label_source`, `repair`), `pairs.csv` every ordered pair with its angle,
+`manifest.json` everything. Generated views use the Gemini gap repair when
+`repair` produced one, else the screening inpaint; their masks are the
+edited person's silhouette (dark clothing filled in, enclosed holes filled).
 
 ## Notes & limitations
 

@@ -244,7 +244,7 @@ def foreground_mask(gemini_bgr, person_mask=None):
     return m
 
 
-def composite_onto_background(original_bgr, gemini_bgr, person_mask):
+def composite_onto_background(original_bgr, gemini_bgr, person_mask, return_fg=False):
     """
     Paste Gemini's redirected person over the original photo.
 
@@ -252,7 +252,8 @@ def composite_onto_background(original_bgr, gemini_bgr, person_mask):
     the original background elsewhere, and black (0) in gap_mask — pixels
     the old person covered that the new pose no longer does. Repair passes
     must use gap_mask rather than "pixel == 0", because genuinely black hair
-    or clothing is also 0.
+    or clothing is also 0. With return_fg=True also returns the mask (0/255)
+    of the pasted person, i.e. the edited person's silhouette.
     """
     h, w = original_bgr.shape[:2]
     if gemini_bgr.shape[:2] != (h, w):
@@ -277,4 +278,4 @@ def composite_onto_background(original_bgr, gemini_bgr, person_mask):
     composite[fg > 0] = gem[fg > 0]
     gap = ((person_mask > 2) & (fg == 0)).astype(np.uint8) * 255
     composite[gap > 0] = 0
-    return composite, gap
+    return (composite, gap, fg) if return_fg else (composite, gap)

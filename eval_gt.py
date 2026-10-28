@@ -27,7 +27,9 @@ Workflow (each stage is a subcommand; all state lives under --data):
      label-source  Label the gaze of the person in each source photo.
   6. repair    Gemini gap repair for accepted candidates only (replaces the
                screening inpaint); `unrepair` reverts individual samples.
-     finalize  Exports final/ with a manifest (no API calls).
+     finalize  Exports final/ as scenes: every labelled view of each person
+               (original + accepted edits) with its own mask; any two views
+               of a scene form a pair (no API calls).
 
 Gaze label convention (matches the training-based pipeline, Part II):
   dx > 0 image-right, dy > 0 UP, dz > 0 TOWARD the camera,
@@ -67,6 +69,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+from model_utils import composite_onto_background, remove_red_marker
 from dataset_pipeline import (
     generate_depth_map,
     isolate_person_and_depth,
@@ -1630,7 +1633,7 @@ function card(d) {
   const im = (t, f) => `<a href="${f}" target="_blank"><img loading="lazy" src="${t}" alt=""></a>`;
   return `<div class="card ${d.verdict || ""}" id="c-${d.image}-${d.cand_id}">
     <div class="imgs">${im(d.t_src, d.f_src)}${im(d.t_fin, d.f_fin)}${im(d.t_lab, d.f_fin)}</div>
-    <div class="lab"><span>原圖${d.src_yaw === null ? "（gaze 未標註）" : `（yaw ${sgn(d.src_yaw)} · pitch ${sgn(d.src_pitch)}）`}</span><span>結果（GT 影像）</span><span>結果 + label 方向</span></div>
+    <div class="lab"><span>原圖${d.src_yaw === null ? "（gaze 未標註）" : `（yaw ${sgn(d.src_yaw)} · pitch ${sgn(d.src_pitch)}）`}</span><span>生成結果</span><span>結果 + label 方向</span></div>
     <div class="meta">${dial(d.yaw)}
       <b>${d.image} / ${d.cand_id}</b><span class="tag">${d.category}</span>
       <span>yaw ${sgn(d.yaw)} · pitch ${sgn(d.pitch)}</span>
@@ -1751,85 +1754,167 @@ def cmd_gallery(store, args):
 #  6. FINALIZE
 # ══════════════════════════════════════════════════════════════════════════════
 
+def view_person_mask(image, raw, sam_mask):
+    """
+    Person mask (0/255) of a generated view, for export. Starts from the
+    compositing foreground, then adds pixels inside the original person's area
+    that Gemini drew but that fall under the compositing threshold (very dark
+    clothing/hair, max channel 4-8) and fills enclosed holes, so a dark hoodie
+    doesn't come out as a sieve. Other people cut out of the source mask stay
+    excluded, since those regions open onto the background.
+    """
+    _, _, fg = composite_onto_background(image, raw, sam_mask, return_fg=True)
+    h, w = image.shape[:2]
+    raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_LANCZOS4)
+    raw = remove_red_marker(raw)
+    k = lambda n: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (n, n))
+    dark = ((raw.max(axis=2) > 3) & (cv2.dilate(sam_mask, k(15)) > 0)).astype(np.uint8) * 255
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, k(5))
+    m = cv2.morphologyEx(cv2.bitwise_or(fg, dark), cv2.MORPH_CLOSE, k(15))
+    flood = m.copy()
+    cv2.floodFill(flood, np.zeros((h + 2, w + 2), np.uint8), (0, 0), 255)
+    m = cv2.bitwise_or(m, cv2.bitwise_not(flood))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if n > 1:
+        keep = np.zeros(n, bool)
+        keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= max(200, 0.02 * stats[1:, cv2.CC_STAT_AREA].max())
+        m = np.where(keep[labels], 255, 0).astype(np.uint8)
+    return m
+
+
 def cmd_finalize(store, args):
-    """Export the accepted set to <data>/final/. Each target uses the Gemini gap
-    repair if `repair` produced one, else the screening inpaint; no API calls."""
+    """
+    Export the dataset to <data>/final/ as scenes, not (source, target) pairs:
+    each scene is one photo and holds every view of its person — the original
+    plus each accepted generated edit — with that view's gaze label and person
+    mask. Any two views of a scene form a pair, in either direction.
+
+      final/<image>/views/<view_id>.png   view_id = "orig" or the candidate id
+      final/<image>/masks/<view_id>.png   person mask of that view
+      final/manifest.json                 scenes -> views with labels
+      final/views.csv                     one row per view
+      final/pairs.csv                     every ordered pair within a scene
+
+    Generated views use the Gemini gap repair if `repair` produced one, else
+    the screening inpaint. No API calls.
+    """
+    import csv
+    import shutil
+
     accepted = accepted_candidates(store)
-    if not accepted:
-        print("[Finalize] No accepted candidates.")
-        return
     if args.require_gemini:
         before = len(accepted)
         accepted = [(d, m) for d, m in accepted if gt_image(d)[1] == "gemini"]
         print(f"[Finalize] --require-gemini: {before - len(accepted)} without Gemini repair left out.")
+    by_image = {}
+    for d, m in accepted:
+        by_image.setdefault(m["image"], []).append((d, m))
 
-    src_labels = {n: (store.prep_info(n) or {}).get("source_label") for n in store.prepped_names()}
-    no_src = sorted({m["image"] for _, m in accepted if not src_labels.get(m["image"])})
+    def gaze_fields(g):
+        return {k: g[k] for k in ("dx", "dy", "dz", "yaw_deg", "pitch_deg")}
+
+    def export_scene(name):
+        info = store.prep_info(name)
+        image, sam_mask, _, _ = store.load_prep_arrays(name)
+        out = store.final / name
+        if out.exists():
+            shutil.rmtree(out)
+        (out / "views").mkdir(parents=True)
+        (out / "masks").mkdir()
+        views = []
+        sl = info.get("source_label")
+        if sl:
+            cv2.imwrite(str(out / "views" / "orig.png"), image)
+            cv2.imwrite(str(out / "masks" / "orig.png"), sam_mask)
+            views.append({
+                "view_id": "orig", "kind": "original", "repair": None,
+                **gaze_fields(sl["gaze"]), "label_source": "manual",
+                "face_px": sl["face_px"], "target_px": sl["target_px"],
+                "face_depth": sl["face_depth"], "target_depth": sl["target_depth"],
+            })
+        for d, m in sorted(by_image.get(name, []), key=lambda dm: dm[1]["cand_id"]):
+            vid = m["cand_id"]
+            tgt, repair = gt_image(d)
+            raw = cv2.imread(str(d / "05_gemini_raw.png"))
+            (out / "views" / f"{vid}.png").write_bytes(tgt.read_bytes())
+            cv2.imwrite(str(out / "masks" / f"{vid}.png"), view_person_mask(image, raw, sam_mask))
+            lab = label_of(m)
+            views.append({
+                "view_id": vid, "kind": "generated", "repair": repair,
+                **gaze_fields(lab["gaze"]), "label_source": lab["source"],
+                "face_px": lab["face_px"], "target_px": lab["target_px"],
+                "face_depth": lab["face_depth"], "target_depth": lab["target_depth"],
+                "requested": {"gaze": m["gaze"], "target_px": m["target_px"],
+                              "target_depth": m["target_depth"]},
+                "prompt": m["prompt"],
+            })
+        for v in views:
+            v["file"] = f"{name}/views/{v['view_id']}.png"
+            v["mask"] = f"{name}/masks/{v['view_id']}.png"
+        return {"image": name, "category": info["category"], "size": info["size"],
+                "views": views}
+
+    names = sorted(set(by_image) | {n for n in store.prepped_names()
+                                    if (store.prep_info(n) or {}).get("source_label")})
+    no_src = [n for n in names if not (store.prep_info(n) or {}).get("source_label")]
     if no_src:
-        print(f"[Finalize] WARNING: {len(no_src)} source image(s) have no source gaze label "
-              f"(run `label-source`): {', '.join(no_src)}")
+        print(f"[Finalize] WARNING: no source gaze label (orig view left out) for "
+              f"{len(no_src)} image(s): {', '.join(no_src)} — run `label-source`")
 
     store.final.mkdir(parents=True, exist_ok=True)
-    rows = []
-    for d, m in accepted:
-        tgt, repair = gt_image(d)
-        sid = f"{m['image']}_{m['cand_id']}"
-        out = store.final / sid
-        out.mkdir(exist_ok=True)
-        for src, dst in ((store.prep / m["image"] / "image.png", "source.png"),
-                         (tgt, "target.png"),
-                         (store.prep / m["image"] / "mask.png", "mask.png")):
-            out.joinpath(dst).write_bytes(Path(src).read_bytes())
-        lab = label_of(m)
-        g = lab["gaze"]
-        sl = src_labels.get(m["image"])
-        sg = sl["gaze"] if sl else {}
-        rows.append({
-            "sample_id": sid, "image": m["image"], "category": m["category"],
-            "cand_id": m["cand_id"], "round": m["round"],
-            "dx": g["dx"], "dy": g["dy"], "dz": g["dz"],
-            "yaw_deg": g["yaw_deg"], "pitch_deg": g["pitch_deg"],
-            "label_source": lab["source"],
-            "source_dx": sg.get("dx"), "source_dy": sg.get("dy"), "source_dz": sg.get("dz"),
-            "source_yaw_deg": sg.get("yaw_deg"), "source_pitch_deg": sg.get("pitch_deg"),
-            "face_px": lab["face_px"], "target_px": lab["target_px"],
-            "face_depth": lab["face_depth"], "target_depth": lab["target_depth"],
-            "source_label": sl,
-            "requested": {"gaze": m["gaze"], "face_px": m["face_px"],
-                          "target_px": m["target_px"], "target_depth": m["target_depth"]},
-            "relation": m["relation"], "repair": repair, "prompt": m["prompt"],
-        })
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        scenes = list(ex.map(export_scene, names))
+    scenes = [sc for sc in scenes if len(sc["views"]) >= 2]
+    keep = {sc["image"] for sc in scenes}
+    for old in store.final.iterdir():                 # scenes from an earlier export
+        if old.is_dir() and old.name not in keep and (old / "views").exists():
+            shutil.rmtree(old)
 
-    # Drop sample folders from an earlier export that are no longer accepted.
-    keep = {r["sample_id"] for r in rows}
-    for old in store.final.iterdir():
-        if old.is_dir() and old.name not in keep and (old / "target.png").exists():
-            for f in old.iterdir():
-                f.unlink()
-            old.rmdir()
-
-    convention = ("dx>0 image-right, dy>0 up, dz>0 toward camera; "
-                  "yaw=atan2(dx,dz), pitch=asin(dy); gaze = direction from the face point to "
-                  "a target point at a chosen depth (Z ~ 1/depth, f = 0.8*width). "
-                  "dx..pitch_deg = target image gaze; label_source 'requested' = the target "
-                  "Gemini was asked for, 'manual' = set by the reviewer to where the person "
-                  "actually looks. source_* = gaze of the person in source.png, labelled "
-                  "manually the same way. repair = gap fill used for target.png.")
+    convention = ("dx>0 image-right, dy>0 up, dz>0 toward camera; yaw=atan2(dx,dz), "
+                  "pitch=asin(dy). Each view's gaze is the direction from its face point to a "
+                  "target point at a chosen depth (Z ~ 1/depth, f = 0.8*width), all in that "
+                  "view's own image. kind: 'original' = the real photo, 'generated' = a Gemini "
+                  "edit of it (training-free pipeline). label_source: 'manual' = set by a "
+                  "reviewer to where the person looks, 'requested' = the target Gemini was "
+                  "asked for and judged correct. repair = gap fill of a generated view. "
+                  "Any two views of a scene form a pair, in either direction.")
     (store.final / "manifest.json").write_text(json.dumps(
-        {"convention": convention, "total": len(rows), "samples": rows},
+        {"convention": convention, "scenes": scenes,
+         "n_scenes": len(scenes), "n_views": sum(len(sc["views"]) for sc in scenes)},
         indent=2, ensure_ascii=False), encoding="utf-8")
-    import csv
-    with open(store.final / "manifest.csv", "w", newline="", encoding="utf-8") as fh:
-        cols = ["sample_id", "image", "category", "cand_id", "round",
-                "dx", "dy", "dz", "yaw_deg", "pitch_deg", "label_source",
-                "source_dx", "source_dy", "source_dz", "source_yaw_deg", "source_pitch_deg",
-                "repair"]
-        wr = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
+
+    vcols = ["image", "category", "view_id", "kind", "file", "mask",
+             "dx", "dy", "dz", "yaw_deg", "pitch_deg", "label_source", "repair"]
+    with open(store.final / "views.csv", "w", newline="", encoding="utf-8") as fh:
+        wr = csv.DictWriter(fh, fieldnames=vcols, extrasaction="ignore")
         wr.writeheader()
-        wr.writerows(rows)
-    n_gem = sum(r["repair"] == "gemini" for r in rows)
-    print(f"[Finalize] exported {len(rows)} sample(s) -> {store.final}  "
-          f"(gap repair: {n_gem} Gemini, {len(rows) - n_gem} inpaint)")
+        for sc in scenes:
+            for v in sc["views"]:
+                wr.writerow({"image": sc["image"], "category": sc["category"], **v})
+
+    n_pairs = 0
+    with open(store.final / "pairs.csv", "w", newline="", encoding="utf-8") as fh:
+        wr = csv.writer(fh)
+        wr.writerow(["image", "category", "view_a", "view_b", "kind_a", "kind_b",
+                     "file_a", "file_b", "angle_deg"])
+        for sc in scenes:
+            for a in sc["views"]:
+                for b in sc["views"]:
+                    if a is b:
+                        continue
+                    va = np.array([a["dx"], a["dy"], a["dz"]])
+                    vb = np.array([b["dx"], b["dy"], b["dz"]])
+                    wr.writerow([sc["image"], sc["category"], a["view_id"], b["view_id"],
+                                 a["kind"], b["kind"], a["file"], b["file"],
+                                 round(angular_diff_deg(va, vb), 2)])
+                    n_pairs += 1
+
+    n_views = sum(len(sc["views"]) for sc in scenes)
+    n_gen = sum(v["kind"] == "generated" for sc in scenes for v in sc["views"])
+    n_gem = sum(v["repair"] == "gemini" for sc in scenes for v in sc["views"])
+    print(f"[Finalize] {len(scenes)} scene(s), {n_views} view(s) "
+          f"({n_views - n_gen} original, {n_gen} generated: {n_gem} Gemini-repaired, "
+          f"{n_gen - n_gem} inpaint), {n_pairs} ordered pair(s) -> {store.final}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1891,9 +1976,10 @@ def main():
     p = sub.add_parser("unrepair", help="drop the Gemini repair of some samples (back to inpaint)")
     p.add_argument("ids", nargs="+", metavar="ID")
 
-    p = sub.add_parser("finalize", help="export the accepted set to final/ (no API calls)")
+    p = sub.add_parser("finalize", help="export scenes of labelled views to final/ (no API calls)")
     p.add_argument("--require-gemini", action="store_true",
-                   help="leave out samples without a Gemini gap repair")
+                   help="leave out generated views without a Gemini gap repair")
+    p.add_argument("--workers", type=int, default=6)
 
     args = ap.parse_args()
     store = Store(args.data)
