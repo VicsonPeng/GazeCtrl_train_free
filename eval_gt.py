@@ -2626,6 +2626,256 @@ def cmd_fix_view(store, args):
           f"reverted {modes.count('revert')}. Run `finalize` to update the dataset.")
 
 
+# ── Face point check (final inspection) ──────────────────────────────────────
+#  After the edit the head often moved, while the label's face point stayed
+#  where the face was in the source. face-check detects faces (insightface)
+#  and flags views whose face point is off; face-fix lets you move it.
+
+def _all_views(store):
+    """(key, image path, label, kind) for every view in the dataset."""
+    out = []
+    for name in sorted({m["image"] for _, m in accepted_candidates(store)} | set(store.prepped_names())):
+        sl = (store.prep_info(name) or {}).get("source_label")
+        if sl:
+            out.append((f"{name}/orig", store.prep / name / "image.png", sl, "original"))
+    for d, m in accepted_candidates(store):
+        out.append((cand_key(m), gt_image(d)[0], label_of(m), "generated"))
+    return out
+
+
+def cmd_face_check(store, args):
+    """
+    Detect faces on every view and flag face points that are off: farther
+    than --rel x face size from the detected eyes, or (no face found, e.g. a
+    back view) not on the person mask of the exported view. Writes
+    face_check.json (suggested eye midpoint per view) for face-fix.
+    """
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    from insightface.app import FaceAnalysis
+    app = FaceAnalysis(name="buffalo_l", allowed_modules=["detection"],
+                       providers=["CPUExecutionProvider"])
+    app.prepare(ctx_id=-1, det_size=(640, 640), det_thresh=0.35)
+    ell = lambda n: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (n, n))
+    res = {}
+    views = _all_views(store)
+    for i, (key, path, lab, kind) in enumerate(views, 1):
+        im = cv2.imread(str(path))
+        name, vid = key.split("/")
+        mp = store.final / name / "masks" / f"{vid}.png"
+        mk = cv2.imread(str(mp), cv2.IMREAD_GRAYSCALE) if mp.exists() else None
+        if mk is None or mk.shape != im.shape[:2]:
+            mk = cv2.imread(str(store.prep / name / "mask.png"), cv2.IMREAD_GRAYSCALE)
+        fx, fy = lab["face_px"]
+        on_person = cv2.dilate(mk, ell(25))
+        best = None
+        for f in app.get(im):
+            x0, y0, x1, y1 = [float(v) for v in f.bbox]
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            if not (0 <= int(cy) < im.shape[0] and 0 <= int(cx) < im.shape[1]) or not on_person[int(cy), int(cx)]:
+                continue
+            eyes = f.kps[:2].mean(axis=0) if f.kps is not None else np.array([cx, cy])
+            dist = float(np.hypot(eyes[0] - fx, eyes[1] - fy))
+            if best is None or dist < best["dist"]:
+                best = {"eyes": [float(eyes[0]), float(eyes[1])], "bbox": [x0, y0, x1, y1],
+                        "size": max(x1 - x0, y1 - y0), "score": float(f.det_score), "dist": dist}
+        h, w = mk.shape
+        on = bool(on_person[min(h - 1, max(0, int(fy))), min(w - 1, max(0, int(fx)))])
+        if best:
+            flag = best["dist"] > args.rel * best["size"]
+            why = f"{best['dist']:.0f}px from detected eyes ({best['dist'] / best['size']:.2f} face size)"
+        else:
+            flag = not on
+            why = "no face detected; face point off the person" if flag else "no face detected"
+        res[key] = {"kind": kind, "face_px": [float(fx), float(fy)], "det": best,
+                    "flag": bool(flag), "why": why}
+        if i % 50 == 0:
+            print(f"  {i}/{len(views)}")
+    p = store.root / "face_check.json"
+    p.write_text(json.dumps(res, indent=1), encoding="utf-8")
+    flagged = [k for k, r in res.items() if r["flag"]]
+    print(f"[Face check] {len(res)} views, {sum(r['det'] is not None for r in res.values())} with a "
+          f"detected face; {len(flagged)} flagged -> {p}\n  " + " ".join(flagged))
+
+
+def _set_face(store, key, new_face):
+    """Move a label's face point; the target moves by the same 2D offset so the
+    drawn gaze arrow (what was judged in review) stays the same."""
+    name, vid = key.split("/")
+    if vid == "orig":
+        info = store.prep_info(name)
+        lab = info["source_label"]
+    else:
+        d = store.cand / name / vid
+        m = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+        lab = dict(label_of(m))
+    ox, oy = new_face[0] - lab["face_px"][0], new_face[1] - lab["face_px"][1]
+    old_face = lab.get("face_px_before_fix", lab["face_px"])
+    lab["face_px"] = [float(new_face[0]), float(new_face[1])]
+    lab["target_px"] = [float(lab["target_px"][0] + ox), float(lab["target_px"][1] + oy)]
+    if vid == "orig":
+        shape = cv2.imread(str(store.prep / name / "image.png")).shape
+    else:
+        shape = cv2.imread(str(gt_image(d)[0])).shape
+    g = gaze_from_target(lab["face_px"], lab["target_px"], lab["face_depth"], lab["target_depth"], shape)
+    lab["gaze"] = g
+    lab["face_px_before_fix"] = old_face
+    lab["face_fixed"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    if lab.get("source") == "requested":
+        lab["source"] = "manual"
+    if vid == "orig":
+        info["source_label"] = lab
+        (store.prep / name / "prep.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
+    else:
+        m["label"] = lab
+        store.write_meta(d, m)
+    return lab
+
+
+def cmd_face_fix(store, args):
+    """
+    Move face points flagged by face-check (or --ids / --all).
+      yellow = current face point   green = detected eyes (suggestion)
+      a = use the suggestion   left click = put the face point there
+      space / Enter = save (if moved) + next   k = keep as is + next
+      r = undo the move on this view   b = back   q = quit
+    The target moves with the face, so the gaze arrow keeps its direction.
+    """
+    import tkinter as tk
+    from PIL import Image, ImageTk
+
+    p = store.root / "face_check.json"
+    fc = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    views = {k: (path, lab, kind) for k, path, lab, kind in _all_views(store)}
+    if args.ids:
+        keys = [k for k in args.ids if k in views]
+    elif args.all:
+        keys = list(views)
+    else:
+        keys = [k for k, r in fc.items() if r["flag"] and k in views]
+    if not keys:
+        print("[Face fix] nothing to do (run face-check, or pass --ids / --all).")
+        return
+    print(f"[Face fix] {len(keys)} view(s).")
+    root = tk.Tk()
+    root.geometry("+0+0")
+    cw, ch = root.winfo_screenwidth() - 30, root.winfo_screenheight() - 200
+    canvas = tk.Canvas(root, width=cw, height=ch, bg="black", highlightthickness=0, cursor="tcross")
+    canvas.pack()
+    status = tk.Label(root, font=("Arial", 12, "bold"))
+    status.pack(pady=(4, 0))
+    tk.Label(root, font=("Arial", 10), text=(
+        "yellow = current face point   green = detected eyes   a = use suggestion   "
+        "left click = set face point   space = save + next   k = keep + next   r = undo   "
+        "b = back   q = quit")).pack(pady=(0, 4))
+    S = {"pos": 0, "new": None, "img": None, "scale": 1, "off": (0, 0), "done": 0}
+
+    def cur():
+        k = keys[S["pos"]]
+        path, lab, kind = views[k]
+        return k, path, lab
+
+    def load():
+        k, path, lab = cur()
+        S["img"] = cv2.imread(str(path))
+        S["new"] = None
+        # crop around the person: face point, suggestion and target
+        pts = [lab["face_px"]]
+        det = (fc.get(k) or {}).get("det")
+        if det:
+            pts += [det["eyes"], det["bbox"][:2], det["bbox"][2:]]
+        pts = np.array(pts, float)
+        h, w = S["img"].shape[:2]
+        span = max(260.0, float(np.ptp(pts[:, 0])) + 300, float(np.ptp(pts[:, 1])) + 300)
+        c = pts.mean(axis=0)
+        x0 = int(np.clip(c[0] - span / 2, 0, max(0, w - span)))
+        y0 = int(np.clip(c[1] - span / 2, 0, max(0, h - span)))
+        S["off"] = (x0, y0)
+        S["crop"] = S["img"][y0:y0 + int(span), x0:x0 + int(span)]
+        S["scale"] = min(cw / S["crop"].shape[1], ch / S["crop"].shape[0])
+        draw()
+
+    def to_c(pt):
+        return ((pt[0] - S["off"][0]) * S["scale"], (pt[1] - S["off"][1]) * S["scale"])
+
+    def draw():
+        k, path, lab = cur()
+        sc = S["scale"]
+        disp = cv2.resize(S["crop"], None, fx=sc, fy=sc,
+                          interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_LINEAR)
+        img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)))
+        canvas._img = img
+        canvas.delete("all")
+        canvas.create_image(0, 0, image=img, anchor="nw")
+        det = (fc.get(k) or {}).get("det")
+        if det:
+            a, b = to_c(det["bbox"][:2]), to_c(det["bbox"][2:])
+            canvas.create_rectangle(*a, *b, outline="#3c3", width=2, dash=(4, 3))
+            ex, ey = to_c(det["eyes"])
+            canvas.create_line(ex - 12, ey, ex + 12, ey, fill="#3f3", width=3)
+            canvas.create_line(ex, ey - 12, ex, ey + 12, fill="#3f3", width=3)
+        fx, fy = to_c(lab["face_px"])
+        tx, ty = to_c(lab["target_px"])
+        canvas.create_oval(fx - 9, fy - 9, fx + 9, fy + 9, outline="yellow", width=3)
+        canvas.create_line(fx, fy, fx + (tx - fx) * 0.35, fy + (ty - fy) * 0.35, fill="yellow",
+                           width=2, arrow="last", dash=(5, 3))
+        if S["new"]:
+            nx, ny = to_c(S["new"])
+            canvas.create_oval(nx - 9, ny - 9, nx + 9, ny + 9, outline="#0ff", width=3)
+            canvas.create_line(nx, ny, nx + (tx - fx) * 0.35, ny + (ty - fy) * 0.35, fill="#0ff",
+                               width=3, arrow="last")
+        r = fc.get(k) or {}
+        status.config(text=f"[{S['pos'] + 1}/{len(keys)}]  {k}   {r.get('why', '')}"
+                           f"{'   -> moved (space to save)' if S['new'] else ''}"
+                           f"{'   [fixed before]' if lab.get('face_fixed') else ''}   saved {S['done']}")
+        root.title(f"Face fix — {k}")
+
+    def click(e):
+        S["new"] = [S["off"][0] + e.x / S["scale"], S["off"][1] + e.y / S["scale"]]
+        draw()
+
+    def step(n):
+        S["pos"] = min(max(0, S["pos"] + n), len(keys) - 1)
+        load()
+
+    def on_key(e):
+        k = e.keysym.lower()
+        key, path, lab = cur()
+        if k == "a":
+            det = (fc.get(key) or {}).get("det")
+            if det:
+                S["new"] = list(det["eyes"])
+                draw()
+        elif k in ("space", "return"):
+            if S["new"]:
+                views[key] = (path, _set_face(store, key, S["new"]), views[key][2])
+                S["done"] += 1
+            if S["pos"] + 1 < len(keys):
+                step(1)
+            else:
+                load()
+        elif k == "k":
+            step(1)
+        elif k == "r":
+            if lab.get("face_fixed"):
+                views[key] = (path, _set_face(store, key, lab["face_px_before_fix"]), views[key][2])
+            S["new"] = None
+            load()
+        elif k == "b":
+            step(-1)
+        elif k == "q":
+            root.destroy()
+
+    canvas.bind("<Button-1>", click)
+    root.bind("<Key>", on_key)
+    load()
+    root.lift()
+    root.attributes("-topmost", True)
+    root.after(400, lambda: root.attributes("-topmost", False))
+    root.focus_force()
+    root.mainloop()
+    print(f"[Face fix] moved {S['done']} face point(s). Run `finalize` to update the dataset.")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  5. STATS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3303,6 +3553,14 @@ def main():
     p = sub.add_parser("unfix", help="remove the targeted fix of some views")
     p.add_argument("ids", nargs="+", metavar="ID")
 
+    p = sub.add_parser("face-check", help="flag label face points that are off the face (insightface)")
+    p.add_argument("--rel", type=float, default=0.5,
+                   help="flag if farther than this x face size from the detected eyes")
+
+    p = sub.add_parser("face-fix", help="move flagged face points (target moves along)")
+    p.add_argument("--ids", nargs="+", metavar="ID")
+    p.add_argument("--all", action="store_true")
+
     p = sub.add_parser("unrepair", help="drop the Gemini repair of some samples (back to inpaint)")
     p.add_argument("ids", nargs="+", metavar="ID")
 
@@ -3318,6 +3576,7 @@ def main():
      "stats": cmd_stats, "gallery": cmd_gallery, "label-source": cmd_label_source,
      "repair-select": cmd_repair_select, "repair": cmd_repair, "remerge": cmd_remerge,
      "repair-view": cmd_repair_view, "merge-select": cmd_merge_select, "unrepair": cmd_unrepair,
+     "face-check": cmd_face_check, "face-fix": cmd_face_fix,
      "issue-tag": cmd_issue_tag, "fix": cmd_fix, "fix-view": cmd_fix_view, "unfix": cmd_unfix,
      "finalize": cmd_finalize}[args.cmd](store, args)
 
