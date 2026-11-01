@@ -32,6 +32,7 @@ Workflow (each stage is a subcommand; all state lives under --data):
                rim of the gap is filled locally, only real holes go to Gemini,
                and its full response is kept: `repair-view` shows it,
                `remerge --merge feather|full|gap` recombines without API calls,
+               `merge-select` picks full or feather view by view,
                `unrepair` reverts individual samples.
      finalize  Exports final/ as scenes: every labelled view of each person
                (original + accepted edits) with its own mask; any two views
@@ -1535,8 +1536,12 @@ REPAIR_FILES = ("08_final_gemini.png", "08a_sent.png", "08b_gemini_response.png"
                 "08c_holes.png", "08d_person.png", "08_repair.json")
 
 
-def write_repair_result(d, mode):
-    """(Re)build 08_final_gemini.png from the saved send/response files."""
+def write_repair_result(d, mode, chosen=False):
+    """
+    (Re)build 08_final_gemini.png from the saved send/response files.
+    chosen=True marks a merge picked by hand in `merge-select`; a plain
+    `remerge` leaves those alone.
+    """
     base = cv2.imread(str(d / "08a_sent.png"))
     holes = cv2.imread(str(d / "08c_holes.png"), cv2.IMREAD_GRAYSCALE)
     rp = d / "08b_gemini_response.png"
@@ -1550,8 +1555,14 @@ def write_repair_result(d, mode):
     (d / "08_repair.json").write_text(json.dumps(
         {"merge": mode if resp is not None else "rim-only (TELEA)",
          "gemini_called": resp is not None,
+         "chosen": bool(chosen and resp is not None),
          "hole_pct": round(cv2.countNonZero(holes) / holes.size * 100, 3)}, indent=2),
         encoding="utf-8")
+
+
+def repair_info(d):
+    p = d / "08_repair.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
 
 
 def cmd_repair(store, args):
@@ -1635,15 +1646,23 @@ def cmd_repair(store, args):
 
 
 def cmd_remerge(store, args):
-    """Re-merge saved Gemini responses with another --merge mode (no API calls)."""
-    n = 0
+    """
+    Re-merge saved Gemini responses with another --merge mode (no API calls).
+    Views picked by hand in `merge-select` are skipped unless named in --ids.
+    """
+    n = kept = 0
     for d, m in accepted_candidates(store):
         if args.ids and cand_key(m) not in args.ids and f"{m['image']}_{m['cand_id']}" not in args.ids:
             continue
-        if (d / "08a_sent.png").exists():
-            write_repair_result(d, args.merge)
-            n += 1
-    print(f"[Remerge] {n} view(s) merged with mode '{args.merge}'.")
+        if not (d / "08a_sent.png").exists():
+            continue
+        if not args.ids and repair_info(d).get("chosen"):
+            kept += 1
+            continue
+        write_repair_result(d, args.merge, chosen=bool(args.ids))
+        n += 1
+    print(f"[Remerge] {n} view(s) merged with mode '{args.merge}'"
+          + (f"; {kept} hand-picked in merge-select kept" if kept else "") + ".")
 
 
 def cmd_unrepair(store, args):
@@ -1761,6 +1780,159 @@ def cmd_repair_view(store, args):
     root.after(400, lambda: root.attributes("-topmost", False))
     root.focus_force()
     root.mainloop()
+
+
+def cmd_merge_select(store, args):
+    """
+    Pick, per Gemini-repaired view, which result goes into the dataset:
+    Gemini's whole image (full) or the feather merge. The choice is written at
+    once (08_final_gemini.png + "chosen" in 08_repair.json); no API calls.
+      1 / g = Gemini full    2 / f = feather    (both save and go to the next)
+      space / n = next without changing    b = back
+      z = close-up of the next hole    t = flip both panes to the sent image
+      q = quit
+    Starts at the first view not picked yet (--all: from the start).
+    """
+    import tkinter as tk
+    from PIL import Image, ImageTk
+
+    items = [(d, m) for d, m in accepted_candidates(store)
+             if (d / "08b_gemini_response.png").exists()]
+    if args.ids:
+        items = [(d, m) for d, m in items if cand_key(m) in args.ids
+                 or f"{m['image']}_{m['cand_id']}" in args.ids]
+    if not items:
+        print("[Merge select] No views with a saved Gemini response (run `repair`).")
+        return
+    root = tk.Tk()
+    root.geometry("+0+0")
+    scr_w, scr_h = root.winfo_screenwidth(), root.winfo_screenheight()
+    pane_w, pane_h = (scr_w - 40) // 2, scr_h - 210
+    top = tk.Frame(root)
+    top.pack()
+    panes, frames, titles = [], [], []
+    for title in ("[1 / g]  Gemini full image", "[2 / f]  feather merge"):
+        col = tk.Frame(top, bd=0, highlightthickness=5, highlightbackground="#444")
+        col.pack(side=tk.LEFT, padx=4)
+        lab = tk.Label(col, text=title, font=("Arial", 12, "bold"))
+        lab.pack()
+        c = tk.Canvas(col, width=pane_w, height=pane_h, bg="black", highlightthickness=0)
+        c.pack()
+        panes.append(c)
+        frames.append(col)
+        titles.append(lab)
+    status = tk.Label(root, font=("Arial", 12, "bold"))
+    status.pack(pady=(4, 0))
+    tk.Label(root, font=("Arial", 10), text=(
+        "1 / g = use Gemini full    2 / f = use feather    space / n = next    b = back    "
+        "z = close-up of next hole    t = show sent image    q = quit")).pack(pady=(0, 4))
+
+    def picked(d):
+        info = repair_info(d)
+        return info.get("merge") if info.get("chosen") else None
+
+    start = 0
+    if not args.all:
+        start = next((i for i, (d, _) in enumerate(items) if not picked(d)), len(items) - 1)
+    pos, zoom, peek = [start], [0], [False]
+    cache = {}
+
+    def images(d):
+        if d not in cache:
+            sent = cv2.imread(str(d / "08a_sent.png"))
+            resp = cv2.imread(str(d / "08b_gemini_response.png"))
+            holes = cv2.imread(str(d / "08c_holes.png"), cv2.IMREAD_GRAYSCALE)
+            person, old_mask = repair_context(d)
+            cache.clear()
+            cache[d] = (sent, merge_repair(sent, resp, holes, "full"),
+                        merge_repair(sent, resp, holes, "feather", person, old_mask), holes)
+        return cache[d]
+
+    def put(canvas, bgr):
+        h, w = bgr.shape[:2]
+        sc = min(pane_w / w, pane_h / h)
+        disp = cv2.resize(bgr, (max(1, int(w * sc)), max(1, int(h * sc))),
+                          interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_NEAREST)
+        img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)))
+        canvas._img = img
+        canvas.delete("all")
+        canvas.create_image(pane_w // 2, pane_h // 2, image=img)
+
+    def show():
+        d, m = items[pos[0]]
+        sent, full, feather, holes = images(d)
+        h, w = sent.shape[:2]
+        crop = (slice(0, h), slice(0, w))
+        n, _, stats, _ = cv2.connectedComponentsWithStats(holes, connectivity=8)
+        label = "whole image"
+        if zoom[0] % n and n > 1:
+            order = 1 + np.argsort(-stats[1:, cv2.CC_STAT_AREA])
+            i = int(order[(zoom[0] % n) - 1])
+            x, y, bw, bh = stats[i, :4]
+            pad = max(40, int(0.6 * max(bw, bh)))
+            crop = (slice(max(0, y - pad), min(h, y + bh + pad)),
+                    slice(max(0, x - pad), min(w, x + bw + pad)))
+            label = f"hole {zoom[0] % n}/{n - 1}"
+        for c, im in zip(panes, (full, feather)):
+            put(c, (sent if peek[0] else im)[crop])
+        cur = picked(d)
+        for f, t, mode in zip(frames, titles, ("full", "feather")):
+            on = cur == mode
+            f.config(highlightbackground="#2e9e4f" if on else "#444")
+            t.config(fg="#2e9e4f" if on else "black")
+        n_done = sum(bool(picked(dd)) for dd, _ in items)
+        status.config(text=(
+            f"[{pos[0] + 1}/{len(items)}]  {cand_key(m)}   picked: {cur or '— (now ' + repair_info(d).get('merge', '?') + ')'}"
+            f"   holes {repair_info(d).get('hole_pct', '?')}%   view: {label}"
+            f"{'   [showing SENT image]' if peek[0] else ''}   ({n_done}/{len(items)} picked)"))
+        root.title(f"Merge select — {cand_key(m)}")
+
+    def go(step):
+        pos[0] = min(max(0, pos[0] + step), len(items) - 1)
+        zoom[0] = 0
+        peek[0] = False
+        show()
+
+    def choose(mode):
+        d, m = items[pos[0]]
+        write_repair_result(d, mode, chosen=True)
+        if pos[0] + 1 < len(items):
+            go(1)
+        else:
+            show()
+            print(f"[Merge select] last view done.")
+
+    def on_key(e):
+        k = e.keysym.lower()
+        if k in ("1", "g", "kp_1"):
+            choose("full")
+        elif k in ("2", "f", "kp_2"):
+            choose("feather")
+        elif k in ("space", "return", "n"):
+            go(1)
+        elif k == "b":
+            go(-1)
+        elif k == "z":
+            zoom[0] += 1
+            show()
+        elif k == "t":
+            peek[0] = not peek[0]
+            show()
+        elif k == "q":
+            root.destroy()
+
+    root.bind("<Key>", on_key)
+    show()
+    root.lift()
+    root.attributes("-topmost", True)
+    root.after(400, lambda: root.attributes("-topmost", False))
+    root.focus_force()
+    root.mainloop()
+    picks = [picked(d) for d, _ in items]
+    print(f"[Merge select] picked {sum(p == 'full' for p in picks)} full, "
+          f"{sum(p == 'feather' for p in picks)} feather, "
+          f"{sum(p is None for p in picks)} not picked (keep their current merge). "
+          "Run `finalize` to update the dataset.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2413,6 +2585,10 @@ def main():
     p = sub.add_parser("repair-view", help="sent image | Gemini response | merged result")
     p.add_argument("--ids", nargs="+", metavar="ID")
 
+    p = sub.add_parser("merge-select", help="pick Gemini full image or feather merge per view")
+    p.add_argument("--ids", nargs="+", metavar="ID")
+    p.add_argument("--all", action="store_true", help="start from the first view, not the first unpicked")
+
     p = sub.add_parser("unrepair", help="drop the Gemini repair of some samples (back to inpaint)")
     p.add_argument("ids", nargs="+", metavar="ID")
 
@@ -2427,7 +2603,7 @@ def main():
      "review": cmd_review,
      "stats": cmd_stats, "gallery": cmd_gallery, "label-source": cmd_label_source,
      "repair-select": cmd_repair_select, "repair": cmd_repair, "remerge": cmd_remerge,
-     "repair-view": cmd_repair_view, "unrepair": cmd_unrepair,
+     "repair-view": cmd_repair_view, "merge-select": cmd_merge_select, "unrepair": cmd_unrepair,
      "finalize": cmd_finalize}[args.cmd](store, args)
 
 
