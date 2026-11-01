@@ -326,6 +326,8 @@ python eval_gt.py plan --round 2 --per-image 4      # next round favours bins th
 python eval_gt.py label-source                      # label the gaze of the person in each source photo
 python eval_gt.py repair-select                     # inspect inpaint gap fills, x = needs Gemini fix
 python eval_gt.py repair --selected                 # Gemini gap repair for the marked views only (unrepair ID to revert)
+python eval_gt.py repair-view                       # sent image | Gemini's full response | merged result
+python eval_gt.py remerge --merge full              # recombine saved responses: feather (default) | full | gap
 python eval_gt.py finalize                          # export final/ as scenes of labelled views (no API calls)
 ```
 

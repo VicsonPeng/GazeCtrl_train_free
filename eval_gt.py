@@ -28,7 +28,10 @@ Workflow (each stage is a subcommand; all state lives under --data):
      repair-select  Inspect each accepted view's inpaint gap fill (Gemini
                output | inpaint result | gap close-up), mark the bad ones.
   6. repair    Gemini gap repair for accepted candidates only (replaces the
-               screening inpaint; --selected = only the marked ones);
+               screening inpaint; --selected = only the marked ones). The thin
+               rim of the gap is filled locally, only real holes go to Gemini,
+               and its full response is kept: `repair-view` shows it,
+               `remerge --merge feather|full|gap` recombines without API calls,
                `unrepair` reverts individual samples.
      finalize  Exports final/ as scenes: every labelled view of each person
                (original + accepted edits) with its own mask; any two views
@@ -1425,8 +1428,77 @@ def cmd_repair_select(store, args):
           f"-> `python eval_gt.py repair --selected` ({n_fix} Gemini call(s)).")
 
 
+def split_gap(composite, gap):
+    """
+    Split the gap into a thin rim (<= ~3 px wide, mostly the silhouette edge)
+    and real holes. The rim is filled locally with TELEA, which handles thin
+    lines well, and only the holes are left black for Gemini: at its 1K output
+    resolution Gemini tends to keep a 1-2 px black line as an outline, which
+    came back as a dark seam. Returns (prefilled_composite, hole_mask).
+    """
+    ell = lambda n: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (n, n))
+    holes = cv2.morphologyEx(gap, cv2.MORPH_OPEN, ell(7))
+    holes = cv2.bitwise_and(cv2.dilate(holes, ell(5)), gap)   # keep holes' own rim pixels
+    rim = cv2.bitwise_and(gap, cv2.bitwise_not(holes))
+    pre = composite.copy()
+    if cv2.countNonZero(rim):
+        pre = cv2.inpaint(pre, cv2.dilate(rim, ell(3)), 3, cv2.INPAINT_TELEA)
+        pre[holes > 0] = 0
+    return pre, holes
+
+
+def merge_repair(base, response, holes, mode):
+    """
+    Combine Gemini's repair response with the pre-filled composite.
+      feather: Gemini pixels in the holes, blended into the surroundings over
+               a ~8 px band so there is no hard seam (default)
+      full:    Gemini's whole image (no seams, but the whole frame becomes its
+               1K output upscaled and it may have touched the person)
+      gap:     Gemini pixels in the holes only, hard edge (previous behaviour)
+    """
+    if mode == "full":
+        return response.copy()
+    if mode == "gap":
+        out = base.copy()
+        m = cv2.dilate(holes, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        out[m > 0] = response[m > 0]
+        return out
+    band = cv2.dilate(holes, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)))
+    alpha = cv2.GaussianBlur((band > 0).astype(np.float32), (0, 0), 4)
+    alpha = np.maximum(alpha, (holes > 0).astype(np.float32))[..., None]
+    out = alpha * response.astype(np.float32) + (1 - alpha) * base.astype(np.float32)
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+
+
+REPAIR_FILES = ("08_final_gemini.png", "08a_sent.png", "08b_gemini_response.png",
+                "08c_holes.png", "08_repair.json")
+
+
+def write_repair_result(d, mode):
+    """(Re)build 08_final_gemini.png from the saved send/response files."""
+    base = cv2.imread(str(d / "08a_sent.png"))
+    holes = cv2.imread(str(d / "08c_holes.png"), cv2.IMREAD_GRAYSCALE)
+    resp = cv2.imread(str(d / "08b_gemini_response.png"))
+    if resp is None:                                   # rim only: no Gemini call was needed
+        out = base
+    else:
+        out = merge_repair(base, resp, holes, mode)
+    cv2.imwrite(str(d / "08_final_gemini.png"), out)
+    (d / "08_repair.json").write_text(json.dumps(
+        {"merge": mode if resp is not None else "rim-only (TELEA)",
+         "gemini_called": resp is not None,
+         "hole_pct": round(cv2.countNonZero(holes) / holes.size * 100, 3)}, indent=2),
+        encoding="utf-8")
+
+
 def cmd_repair(store, args):
-    """Gemini gap repair (replacing the screening inpaint) for accepted candidates."""
+    """
+    Gemini gap repair for accepted views. The thin rim of the gap is filled
+    locally first (split_gap); only real holes go to Gemini, so views whose gap
+    is only a rim cost no call. Gemini's full response is saved
+    (08b_gemini_response.png) and merged per --merge; `remerge` changes the
+    merge later without calling Gemini again.
+    """
     accepted = accepted_candidates(store)
     if args.selected:
         marked = {k for k, v in load_repair_selection(store).items() if v == "fix"}
@@ -1435,10 +1507,12 @@ def cmd_repair(store, args):
         want = set(args.ids)
         accepted = [(d, m) for d, m in accepted if cand_key(m) in want
                     or f"{m['image']}_{m['cand_id']}" in want]
-    todo = []
-    small = 0
+    todo, rim_only, small = [], [], 0
     for d, m in accepted:
-        if (d / "08_final_gemini.png").exists() and not (args.ids or args.redo):
+        done = (d / "08b_gemini_response.png").exists() or (
+            (d / "08_repair.json").exists() and not (d / "08b_gemini_response.png").exists()
+            and (d / "08_final_gemini.png").exists())
+        if done and not (args.ids or args.redo):
             continue
         gap = cv2.imread(str(d / "06b_gap_mask.png"), cv2.IMREAD_GRAYSCALE)
         if gap is None:
@@ -1447,27 +1521,42 @@ def cmd_repair(store, args):
         if cv2.countNonZero(gap) / gap.size * 100 < args.min_gap_pct:
             small += 1
             continue
-        todo.append((d, m, gap))
+        composite = cv2.imread(str(d / "06_composite_unfilled.png"))
+        pre, holes = split_gap(composite, gap)
+        (rim_only if not cv2.countNonZero(holes) else todo).append((d, m, pre, holes))
     if args.limit:
         todo = todo[:args.limit]
-    print(f"[Repair] {len(todo)} candidate(s) -> {len(todo)} Gemini call(s)"
+
+    # Rim-only views: no API call needed.
+    for d, m, pre, holes in rim_only:
+        for f in REPAIR_FILES:
+            (d / f).unlink(missing_ok=True)
+        cv2.imwrite(str(d / "08a_sent.png"), pre)
+        cv2.imwrite(str(d / "08c_holes.png"), holes)
+        write_repair_result(d, args.merge)
+    print(f"[Repair] {len(rim_only)} view(s) had only a thin rim -> filled locally, no Gemini call.")
+    print(f"[Repair] {len(todo)} view(s) with real holes -> {len(todo)} Gemini call(s)"
           + (f"; {small} below --min-gap-pct {args.min_gap_pct} keep inpaint" if small else ""))
     if not todo:
         return
     if not args.yes and input("Proceed? (y/N): ").strip().lower() not in ("y", "yes"):
         return
 
-    def one(d, gap):
-        composite = cv2.imread(str(d / "06_composite_unfilled.png"))
-        rep = repair_gemini(composite)
+    def one(d, pre, holes):
+        rep = repair_gemini(pre)
         if rep is None:
             return False
-        cv2.imwrite(str(d / "08_final_gemini.png"), merge_gap_repair(composite, rep, gap))
+        for f in REPAIR_FILES:
+            (d / f).unlink(missing_ok=True)
+        cv2.imwrite(str(d / "08a_sent.png"), pre)
+        cv2.imwrite(str(d / "08b_gemini_response.png"), rep)
+        cv2.imwrite(str(d / "08c_holes.png"), holes)
+        write_repair_result(d, args.merge)
         return True
 
     ok = fail = 0
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(one, d, gap): m for d, m, gap in todo}
+        futs = {ex.submit(one, d, pre, holes): m for d, m, pre, holes in todo}
         for i, fut in enumerate(as_completed(futs), 1):
             m = futs[fut]
             try:
@@ -1479,7 +1568,19 @@ def cmd_repair(store, args):
             fail += not good
             print(f"  [{i}/{len(todo)}] {cand_key(m)}: {'repaired' if good else 'FAILED'}")
     print(f"[Repair] repaired {ok}, failed {fail}. Re-run to retry failures; "
-          "`gallery` shows which image each sample uses.")
+          "`repair-view` shows what Gemini returned.")
+
+
+def cmd_remerge(store, args):
+    """Re-merge saved Gemini responses with another --merge mode (no API calls)."""
+    n = 0
+    for d, m in accepted_candidates(store):
+        if args.ids and cand_key(m) not in args.ids and f"{m['image']}_{m['cand_id']}" not in args.ids:
+            continue
+        if (d / "08a_sent.png").exists():
+            write_repair_result(d, args.merge)
+            n += 1
+    print(f"[Remerge] {n} view(s) merged with mode '{args.merge}'.")
 
 
 def cmd_unrepair(store, args):
@@ -1488,11 +1589,115 @@ def cmd_unrepair(store, args):
     n = 0
     for d, m in store.candidates():
         if cand_key(m) in want or f"{m['image']}_{m['cand_id']}" in want:
-            p = d / "08_final_gemini.png"
-            if p.exists():
-                p.unlink()
+            if (d / "08_final_gemini.png").exists():
                 n += 1
+            for f in REPAIR_FILES:
+                (d / f).unlink(missing_ok=True)
     print(f"[Unrepair] removed {n} Gemini repair(s).")
+
+
+def cmd_repair_view(store, args):
+    """
+    Look at the repairs: what was sent (holes black) | Gemini's full response |
+    the merged result used in the dataset.
+      space / Enter / n = next   b = back   z = close-up of the next hole
+      (whole image first)   q = quit
+    """
+    import tkinter as tk
+    from PIL import Image, ImageTk
+
+    items = [(d, m) for d, m in accepted_candidates(store) if (d / "08a_sent.png").exists()]
+    if args.ids:
+        items = [(d, m) for d, m in items if cand_key(m) in args.ids
+                 or f"{m['image']}_{m['cand_id']}" in args.ids]
+    if not items:
+        print("[Repair view] No repaired views yet (run `repair`).")
+        return
+    root = tk.Tk()
+    root.geometry("+0+0")
+    scr_w, scr_h = root.winfo_screenwidth(), root.winfo_screenheight()
+    pane_w, pane_h = (scr_w - 30) // 3, scr_h - 200
+    top = tk.Frame(root)
+    top.pack()
+    panes = []
+    for title in ("sent to Gemini (holes black)", "Gemini response (full image)",
+                  "result used in the dataset"):
+        col = tk.Frame(top)
+        col.pack(side=tk.LEFT, padx=2)
+        tk.Label(col, text=title, font=("Arial", 10, "bold")).pack()
+        c = tk.Canvas(col, width=pane_w, height=pane_h, bg="black")
+        c.pack()
+        panes.append(c)
+    status = tk.Label(root, font=("Arial", 12, "bold"))
+    status.pack(pady=(4, 0))
+    tk.Label(root, font=("Arial", 10), text=(
+        "space / Enter = next    b = back    z = close-up of next hole (cycles back to "
+        "whole image)    q = quit")).pack(pady=(0, 4))
+    pos, zoom = [0], [0]
+
+    def put(canvas, bgr):
+        h, w = bgr.shape[:2]
+        sc = min(pane_w / w, pane_h / h)
+        disp = cv2.resize(bgr, (max(1, int(w * sc)), max(1, int(h * sc))),
+                          interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_NEAREST)
+        img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)))
+        canvas._img = img
+        canvas.delete("all")
+        canvas.create_image(pane_w // 2, pane_h // 2, image=img)
+
+    def show():
+        d, m = items[pos[0]]
+        sent = cv2.imread(str(d / "08a_sent.png"))
+        resp = cv2.imread(str(d / "08b_gemini_response.png"))
+        fin = cv2.imread(str(d / "08_final_gemini.png"))
+        holes = cv2.imread(str(d / "08c_holes.png"), cv2.IMREAD_GRAYSCALE)
+        if resp is None:
+            resp = np.zeros_like(sent)
+            cv2.putText(resp, "no Gemini call (rim only)", (20, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
+        h, w = sent.shape[:2]
+        crop = (slice(0, h), slice(0, w))
+        n, _, stats, _ = cv2.connectedComponentsWithStats(holes, connectivity=8)
+        label = "whole image"
+        if zoom[0] % n and n > 1:
+            order = 1 + np.argsort(-stats[1:, cv2.CC_STAT_AREA])
+            i = int(order[(zoom[0] % n) - 1])
+            x, y, bw, bh = stats[i, :4]
+            pad = max(30, int(0.5 * max(bw, bh)))
+            crop = (slice(max(0, y - pad), min(h, y + bh + pad)),
+                    slice(max(0, x - pad), min(w, x + bw + pad)))
+            label = f"hole {zoom[0] % n}/{n - 1}"
+        for c, im in zip(panes, (sent, resp, fin)):
+            put(c, im[crop])
+        info = json.loads((d / "08_repair.json").read_text(encoding="utf-8"))
+        status.config(text=f"[{pos[0] + 1}/{len(items)}]  {cand_key(m)}   merge: {info['merge']}   "
+                           f"holes {info['hole_pct']}%   view: {label}")
+        root.title(f"Repair view — {cand_key(m)}")
+
+    def on_key(e):
+        k = e.keysym.lower()
+        if k in ("space", "return", "n"):
+            if pos[0] + 1 < len(items):
+                pos[0] += 1
+                zoom[0] = 0
+                show()
+        elif k == "b":
+            pos[0] = max(0, pos[0] - 1)
+            zoom[0] = 0
+            show()
+        elif k == "z":
+            zoom[0] += 1
+            show()
+        elif k == "q":
+            root.destroy()
+
+    root.bind("<Key>", on_key)
+    show()
+    root.lift()
+    root.attributes("-topmost", True)
+    root.after(400, lambda: root.attributes("-topmost", False))
+    root.focus_force()
+    root.mainloop()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2128,6 +2333,8 @@ def main():
     p.add_argument("--selected", action="store_true",
                    help="only views marked 'fix' in repair-select")
     p.add_argument("--redo", action="store_true", help="repair again even if already repaired")
+    p.add_argument("--merge", choices=["feather", "full", "gap"], default="feather",
+                   help="how Gemini's response is combined (see merge_repair)")
     p.add_argument("--min-gap-pct", type=float, default=0.0,
                    help="keep inpaint when the gap is below this %% of the image")
     p.add_argument("--ids", nargs="+", metavar="ID",
@@ -2135,6 +2342,13 @@ def main():
     p.add_argument("--limit", type=int, help="only the first N (for a trial run)")
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--yes", action="store_true")
+
+    p = sub.add_parser("remerge", help="re-merge saved Gemini responses (no API calls)")
+    p.add_argument("--merge", choices=["feather", "full", "gap"], required=True)
+    p.add_argument("--ids", nargs="+", metavar="ID")
+
+    p = sub.add_parser("repair-view", help="sent image | Gemini response | merged result")
+    p.add_argument("--ids", nargs="+", metavar="ID")
 
     p = sub.add_parser("unrepair", help="drop the Gemini repair of some samples (back to inpaint)")
     p.add_argument("ids", nargs="+", metavar="ID")
@@ -2149,7 +2363,8 @@ def main():
     {"prep": cmd_prep, "plan": cmd_plan, "run": cmd_run, "recomposite": cmd_recomposite,
      "review": cmd_review,
      "stats": cmd_stats, "gallery": cmd_gallery, "label-source": cmd_label_source,
-     "repair-select": cmd_repair_select, "repair": cmd_repair, "unrepair": cmd_unrepair,
+     "repair-select": cmd_repair_select, "repair": cmd_repair, "remerge": cmd_remerge,
+     "repair-view": cmd_repair_view, "unrepair": cmd_unrepair,
      "finalize": cmd_finalize}[args.cmd](store, args)
 
 
