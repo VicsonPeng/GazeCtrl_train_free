@@ -34,6 +34,10 @@ Workflow (each stage is a subcommand; all state lives under --data):
                `remerge --merge feather|full|gap` recombines without API calls,
                `merge-select` picks full or feather view by view,
                `unrepair` reverts individual samples.
+  6b. issue-tag / fix / fix-view   targeted 3rd pass for views that are still
+               bad: tag the problem (implausible / artifact / seam), paint
+               where it is, one Gemini call per view with a prompt built from
+               the tags, blended back inside the painted area only.
      finalize  Exports final/ as scenes: every labelled view of each person
                (original + accepted edits) with its own mask; any two views
                of a scene form a pair (no API calls).
@@ -685,7 +689,7 @@ def write_composite(cdir, image, raw, mask):
     cv2.imwrite(str(cdir / "06_composite_unfilled.png"), composite)
     cv2.imwrite(str(cdir / "06b_gap_mask.png"), gap)
     cv2.imwrite(str(cdir / "07_final_inpaint.png"), final)
-    for stale in ("08_final_gemini.png",):       # built from an older composite
+    for stale in ("08_final_gemini.png", "09_final_fix.png"):   # built from an older composite
         (cdir / stale).unlink(missing_ok=True)
 
 
@@ -1274,7 +1278,13 @@ def accepted_candidates(store):
 
 
 def gt_image(cdir):
-    """The best available target image: Gemini gap repair if done, else inpaint."""
+    """
+    The best available target image: the targeted fix (`fix`) if kept, else
+    the Gemini gap repair if done, else the screening inpaint.
+    """
+    f = cdir / "09_final_fix.png"
+    if f.exists():
+        return f, "gemini"
     g = cdir / "08_final_gemini.png"
     return (g, "gemini") if g.exists() else (cdir / "07_final_inpaint.png", "inpaint")
 
@@ -1935,6 +1945,638 @@ def cmd_merge_select(store, args):
           "Run `finalize` to update the dataset.")
 
 
+# ── Targeted fix (3rd pass) ────────────────────────────────────────────────
+#  issue-tag: mark what is wrong with a view (tags + painted region + note)
+#  fix:       one Gemini call per tagged view, prompt built from the tags,
+#             response blended back inside the painted region only
+#  fix-view:  before | Gemini response | result, pick region / full / revert
+
+ISSUE_TAGS = [            # (key, tag, label in the UI)
+    ("1", "implausible", "不合理"),
+    ("2", "artifact", "artifact"),
+    ("3", "seam", "接縫沒補好"),
+]
+ISSUE_PROMPTS = {
+    "implausible": (
+        "Something in the marked area is physically implausible: for example distorted or "
+        "malformed anatomy (hands, fingers, arms, legs, ears, neck), extra or missing body "
+        "parts, objects that merge into each other or into the person, or broken perspective. "
+        "Correct it so it looks like a real, coherent photograph."),
+    "artifact": (
+        "The marked area contains image-generation artifacts: smudges, blur, noise, colour "
+        "blotches, melted or repeated textures, or garbled details. Replace them with clean, "
+        "realistic detail that matches the rest of the photo."),
+    "seam": (
+        "The marked area shows seams where an edited person was pasted onto the background: "
+        "visible outlines, halos or dark/light fringes along the silhouette, leftover traces "
+        "of the previous pose, or background patches whose colour, brightness or texture do "
+        "not match their surroundings. Blend them so the transition is invisible and the "
+        "background is continuous."),
+}
+FIX_FILES = ("09_final_fix.png", "09a_input.png", "09b_marked.png", "09c_region.png",
+             "09d_response.png", "09_fix.json")
+
+
+def load_issues(store):
+    p = store.root / "issues.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+
+def save_issues(store, issues):
+    p = store.root / "issues.json"
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(issues, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(p)
+
+
+def current_image(d):
+    """The image of this view that is in the dataset before a fix."""
+    g = d / "08_final_gemini.png"
+    return g if g.exists() else d / "07_final_inpaint.png"
+
+
+def build_fix_prompt(tags, note, has_region):
+    where = "the area outlined in red in the second image" if has_region else "the image"
+    parts = [
+        "The first image is a photograph that needs a local fix. "
+        + ("The second image is the same photograph with the area to fix outlined in red; "
+           "it is only a guide, and the red outline must NOT appear in your output. "
+           if has_region else ""),
+        f"Edit {where}:",
+    ]
+    parts += [f"- {ISSUE_PROMPTS[t]}" for t in tags if t in ISSUE_PROMPTS]
+    if note:
+        parts.append(f"- Specifically: {note}")
+    parts.append(
+        "Keep the person's identity, face, hairstyle, clothing, body pose, head orientation and "
+        "gaze direction (where the eyes look) exactly as they are. "
+        + ("Change nothing outside the marked area. " if has_region else "")
+        + "Keep the framing, composition, lighting and colours of the photograph identical, "
+          "and return the whole photograph at the same aspect ratio.")
+    return "\n".join(parts)
+
+
+def mark_region(image, region):
+    """Copy of the image with the region's outline drawn in red (guide for Gemini)."""
+    out = image.copy()
+    cs, _ = cv2.findContours(region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    t = max(3, int(round(max(image.shape[:2]) / 400)))
+    cv2.drawContours(out, cs, -1, (0, 0, 255), t)
+    return out
+
+
+def gemini_fix(images_bgr, prompt, max_retries=3):
+    """Gemini edit with one or more input images; response resized to the first image."""
+    from google import genai
+    from google.genai import types
+    import io
+    from PIL import Image
+    import dataset_pipeline as dp
+
+    client = genai.Client(api_key=dp.GEMINI_API_KEY)
+    h, w = images_bgr[0].shape[:2]
+    parts = [types.Part.from_text(text=prompt)]
+    for im in images_bgr:
+        buf = io.BytesIO()
+        Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB)).save(buf, format="PNG")
+        parts.append(types.Part(inline_data=types.Blob(mime_type="image/png", data=buf.getvalue())))
+    cfg = types.GenerateContentConfig(image_config=types.ImageConfig(image_size="1K"),
+                                      response_modalities=["IMAGE", "TEXT"])
+    for attempt in range(1, max_retries + 1):
+        try:
+            for chunk in client.models.generate_content_stream(
+                    model=dp.GEMINI_MODEL, contents=[types.Content(role="user", parts=parts)],
+                    config=cfg):
+                for part in chunk.parts or []:
+                    if part.inline_data and part.inline_data.data:
+                        pil = Image.open(io.BytesIO(part.inline_data.data)).convert("RGB")
+                        return cv2.cvtColor(np.array(pil.resize((w, h), Image.LANCZOS)),
+                                            cv2.COLOR_RGB2BGR)
+            return None
+        except Exception as e:
+            if attempt < max_retries:
+                time.sleep(20)
+            else:
+                print(f"  [Gemini Fix Error] {e}")
+    return None
+
+
+def align_to(base, resp, max_shift=25):
+    """Undo a small global shift of Gemini's output (phase correlation)."""
+    g = lambda im: cv2.cvtColor(im, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    (sx, sy), resp_q = cv2.phaseCorrelate(g(base), g(resp))
+    if resp_q < 0.05 or abs(sx) > max_shift or abs(sy) > max_shift or abs(sx) + abs(sy) < 0.5:
+        return resp
+    M = np.float32([[1, 0, -sx], [0, 1, -sy]])
+    return cv2.warpAffine(resp, M, (base.shape[1], base.shape[0]), borderMode=cv2.BORDER_REFLECT)
+
+
+def blend_region(base, resp, region, band=12):
+    """
+    Gemini's fix inside the painted region only: aligned, tone-matched from a
+    ring of original pixels around it, grain added back, feathered over `band` px.
+    """
+    ell = lambda n: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (n, n))
+    resp = align_to(base, resp)
+    region = cv2.dilate(region, ell(5))
+    ring = (cv2.dilate(region, ell(2 * band + 31)) > 0) & (region == 0)
+    w = ring.astype(np.float32)
+    num = cv2.GaussianBlur((base.astype(np.float32) - resp.astype(np.float32)) * w[..., None],
+                           (0, 0), 25)
+    den = cv2.GaussianBlur(w, (0, 0), 25)[..., None]
+    out_r = resp.astype(np.float32) + np.where(den > 1e-3, num / np.maximum(den, 1e-3), 0)
+    if ring.any():
+        hf = lambda im: (lambda gg: (gg - cv2.GaussianBlur(gg, (0, 0), 1.2))[ring].std())(
+            cv2.cvtColor(im, cv2.COLOR_BGR2GRAY).astype(np.float32))
+        add = float(np.sqrt(max(0.0, hf(base) ** 2 - hf(resp) ** 2)))
+        if add > 0:
+            out_r += np.random.default_rng(0).normal(0, add, base.shape[:2]).astype(np.float32)[..., None]
+    dist = cv2.distanceTransform((region == 0).astype(np.uint8), cv2.DIST_L2, 5)
+    alpha = np.clip(1 - dist / band, 0, 1)[..., None]
+    out = alpha * out_r + (1 - alpha) * base.astype(np.float32)
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+
+
+def write_fix_result(d, mode):
+    """(Re)build 09_final_fix.png: mode region | full | revert."""
+    info_p = d / "09_fix.json"
+    info = json.loads(info_p.read_text(encoding="utf-8")) if info_p.exists() else {}
+    if mode == "revert":
+        (d / "09_final_fix.png").unlink(missing_ok=True)
+    else:
+        base = cv2.imread(str(d / "09a_input.png"))
+        resp = cv2.imread(str(d / "09d_response.png"))
+        region = cv2.imread(str(d / "09c_region.png"), cv2.IMREAD_GRAYSCALE)
+        if mode == "region" and region is not None and cv2.countNonZero(region):
+            out = blend_region(base, resp, region)
+        else:
+            mode = "full"
+            out = resp
+        cv2.imwrite(str(d / "09_final_fix.png"), out)
+    info["merge"] = mode
+    info_p.write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _select_ids(items, ids):
+    if not ids:
+        return items
+    want = set(ids)
+    return [(d, m) for d, m in items if cand_key(m) in want or f"{m['image']}_{m['cand_id']}" in want]
+
+
+def cmd_issue_tag(store, args):
+    """
+    Mark what is wrong with each view, for `fix`.
+      1 = 不合理 (implausible)   2 = artifact   3 = 接縫 (seam)   (toggle)
+      left drag = paint the problem area    right drag = erase
+      [ / ] = brush size    wheel = zoom at cursor    middle drag = pan
+      t = show: current image / Gemini response / sent to Gemini
+      c = clear painting    x = no issue (remove the entry)
+      click the note box to type a note (Enter returns)
+      space = save + next    b = save + back    q = save + quit
+    Views: --ids, --unpicked (Gemini-repaired views not picked in
+    merge-select), plus every view already in issues.json.
+    """
+    import tkinter as tk
+    from PIL import Image, ImageTk
+
+    issues = load_issues(store)
+    acc = accepted_candidates(store)
+    keys = set(issues)
+    if args.ids:
+        keys |= {cand_key(m) for d, m in _select_ids(acc, args.ids)}
+    if args.unpicked:
+        keys |= {cand_key(m) for d, m in acc if (d / "08b_gemini_response.png").exists()
+                 and not repair_info(d).get("chosen")}
+    items = [(d, m) for d, m in acc if cand_key(m) in keys]
+    if not items:
+        print("[Issue tag] No views (use --ids or --unpicked).")
+        return
+    print(f"[Issue tag] {len(items)} view(s).")
+
+    root = tk.Tk()
+    root.geometry("+0+0")
+    scr_w, scr_h = root.winfo_screenwidth(), root.winfo_screenheight()
+    cw, ch = scr_w - 30, scr_h - 230
+    canvas = tk.Canvas(root, width=cw, height=ch, bg="black", highlightthickness=0, cursor="tcross")
+    canvas.pack()
+    bar = tk.Frame(root)
+    bar.pack(pady=(4, 0))
+    tag_vars = {}
+    for k, tag, lab in ISSUE_TAGS:
+        v = tk.BooleanVar()
+        tk.Checkbutton(bar, text=f"[{k}] {lab}", variable=v, font=("Arial", 12, "bold"),
+                       takefocus=0).pack(side=tk.LEFT, padx=8)
+        tag_vars[tag] = v
+    tk.Label(bar, text="note:", font=("Arial", 11)).pack(side=tk.LEFT, padx=(16, 2))
+    note = tk.Entry(bar, width=70, font=("Arial", 11))
+    note.pack(side=tk.LEFT)
+    status = tk.Label(root, font=("Arial", 12, "bold"))
+    status.pack(pady=(2, 0))
+    tk.Label(root, font=("Arial", 10), text=(
+        "1/2/3 = tag    left drag = paint problem area    right drag = erase    [ ] = brush    "
+        "wheel = zoom    middle drag = pan    t = current/Gemini/sent    c = clear    "
+        "x = no issue    space = save+next    b = back    q = quit")).pack(pady=(0, 4))
+
+    S = {"pos": 0, "img": None, "alts": [], "alt": 0, "mask": None, "scale": 1.0,
+         "ox": 0.0, "oy": 0.0, "brush": 18, "pending": False, "pan": None}
+
+    def fit():
+        h, w = S["img"].shape[:2]
+        S["scale"] = min(cw / w, ch / h)
+        S["ox"] = (w - cw / S["scale"]) / 2
+        S["oy"] = (h - ch / S["scale"]) / 2
+
+    def redraw():
+        S["pending"] = False
+        im = S["alts"][S["alt"]]
+        h, w = im.shape[:2]
+        sc = S["scale"]
+        # canvas pixel -> image coordinate: x = ox + u / sc
+        M = np.float32([[sc, 0, -S["ox"] * sc], [0, sc, -S["oy"] * sc]])
+        interp = cv2.INTER_LINEAR if sc < 1 else cv2.INTER_NEAREST
+        disp = cv2.warpAffine(im, M, (cw, ch), flags=interp, borderValue=(0, 0, 0))
+        mk = cv2.warpAffine(S["mask"], M, (cw, ch), flags=cv2.INTER_NEAREST)
+        sel = mk > 0
+        disp[sel] = (0.55 * disp[sel] + 0.45 * np.array([60, 60, 255])).astype(np.uint8)
+        edge = cv2.morphologyEx(mk, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > 0
+        disp[edge] = (0, 0, 255)
+        img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)))
+        canvas._img = img
+        canvas.delete("all")
+        canvas.create_image(0, 0, image=img, anchor="nw")
+        update_status()
+
+    def later():
+        if not S["pending"]:
+            S["pending"] = True
+            root.after(25, redraw)
+
+    def update_status():
+        d, m = items[S["pos"]]
+        names = ["current image", "Gemini response", "sent to Gemini"]
+        area = cv2.countNonZero(S["mask"]) / S["mask"].size * 100
+        done = sum(1 for _, mm in items if issues.get(cand_key(mm), {}).get("tags"))
+        status.config(text=(
+            f"[{S['pos'] + 1}/{len(items)}]  {cand_key(m)}   showing: {names[S['alt']]}   "
+            f"painted {area:.2f}%   brush {S['brush']}px   zoom {S['scale']:.2f}   "
+            f"({done}/{len(items)} tagged)"))
+        root.title(f"Issue tag — {cand_key(m)}")
+
+    def load():
+        d, m = items[S["pos"]]
+        cur = cv2.imread(str(current_image(d)))
+        alts = [cur]
+        for f in ("08b_gemini_response.png", "08a_sent.png"):
+            a = cv2.imread(str(d / f)) if (d / f).exists() else None
+            if a is not None:
+                alts.append(cv2.resize(a, (cur.shape[1], cur.shape[0])))
+        S.update(img=cur, alts=alts, alt=0)
+        rp = d / "09r_region.png"
+        mk = cv2.imread(str(rp), cv2.IMREAD_GRAYSCALE) if rp.exists() else None
+        S["mask"] = mk if mk is not None and mk.shape == cur.shape[:2] else np.zeros(cur.shape[:2], np.uint8)
+        e = issues.get(cand_key(m), {})
+        for tag, v in tag_vars.items():
+            v.set(tag in e.get("tags", []))
+        note.delete(0, tk.END)
+        note.insert(0, e.get("note", ""))
+        fit()
+        redraw()
+
+    def save():
+        d, m = items[S["pos"]]
+        tags = [t for _, t, _ in ISSUE_TAGS if tag_vars[t].get()]
+        k = cand_key(m)
+        if tags or cv2.countNonZero(S["mask"]) or note.get().strip():
+            issues[k] = {"tags": tags, "note": note.get().strip(),
+                         "region": bool(cv2.countNonZero(S["mask"]))}
+        else:
+            issues.pop(k, None)
+        if cv2.countNonZero(S["mask"]):
+            cv2.imwrite(str(d / "09r_region.png"), S["mask"])
+        else:
+            (d / "09r_region.png").unlink(missing_ok=True)
+        save_issues(store, issues)
+
+    def to_img(e):
+        return S["ox"] + e.x / S["scale"], S["oy"] + e.y / S["scale"]
+
+    def paint(e, val):
+        x, y = to_img(e)
+        r = max(1, int(round(S["brush"] / S["scale"])))
+        last = S.get("last")
+        p = (int(round(x)), int(round(y)))
+        if last:
+            cv2.line(S["mask"], last, p, val, 2 * r)
+        cv2.circle(S["mask"], p, r, val, -1)
+        S["last"] = p
+        later()
+
+    def zoom(e):
+        f = 1.25 if e.delta > 0 else 0.8
+        x, y = to_img(e)
+        S["scale"] = min(max(S["scale"] * f, 0.1), 12)
+        S["ox"], S["oy"] = x - e.x / S["scale"], y - e.y / S["scale"]
+        later()
+
+    def pan_start(e):
+        S["pan"] = (e.x, e.y, S["ox"], S["oy"])
+
+    def pan_move(e):
+        x0, y0, ox, oy = S["pan"]
+        S["ox"], S["oy"] = ox - (e.x - x0) / S["scale"], oy - (e.y - y0) / S["scale"]
+        later()
+
+    def go(step):
+        save()
+        S["pos"] = min(max(0, S["pos"] + step), len(items) - 1)
+        load()
+
+    canvas.bind("<Button-1>", lambda e: (canvas.focus_set(), S.update(last=None), paint(e, 255)))
+    canvas.bind("<B1-Motion>", lambda e: paint(e, 255))
+    canvas.bind("<Button-3>", lambda e: (S.update(last=None), paint(e, 0)))
+    canvas.bind("<B3-Motion>", lambda e: paint(e, 0))
+    canvas.bind("<ButtonRelease-1>", lambda e: S.update(last=None))
+    canvas.bind("<ButtonRelease-3>", lambda e: S.update(last=None))
+    canvas.bind("<MouseWheel>", zoom)
+    canvas.bind("<Button-2>", pan_start)
+    canvas.bind("<B2-Motion>", pan_move)
+    note.bind("<Return>", lambda e: (canvas.focus_set(), "break")[1])
+
+    def on_key(e):
+        if root.focus_get() is note:
+            return
+        k = e.keysym.lower()
+        for key, tag, _ in ISSUE_TAGS:
+            if k in (key, f"kp_{key}"):
+                tag_vars[tag].set(not tag_vars[tag].get())
+                return
+        if k == "space":
+            if S["pos"] + 1 < len(items):
+                go(1)
+            else:
+                save()
+                print("[Issue tag] last view saved.")
+                update_status()
+        elif k == "b":
+            go(-1)
+        elif k == "bracketleft":
+            S["brush"] = max(2, int(S["brush"] / 1.3))
+            update_status()
+        elif k == "bracketright":
+            S["brush"] = min(300, int(S["brush"] * 1.3) + 1)
+            update_status()
+        elif k == "t":
+            S["alt"] = (S["alt"] + 1) % len(S["alts"])
+            later()
+        elif k == "c":
+            S["mask"][:] = 0
+            later()
+        elif k == "x":
+            for v in tag_vars.values():
+                v.set(False)
+            note.delete(0, tk.END)
+            S["mask"][:] = 0
+            later()
+        elif k == "f":
+            fit()
+            later()
+        elif k == "q":
+            save()
+            root.destroy()
+
+    root.bind("<Key>", on_key)
+    root.protocol("WM_DELETE_WINDOW", lambda: (save(), root.destroy()))
+    load()
+    root.lift()
+    root.attributes("-topmost", True)
+    root.after(400, lambda: root.attributes("-topmost", False))
+    canvas.focus_set()
+    root.mainloop()
+    n = sum(1 for _, m in items if issues.get(cand_key(m), {}).get("tags"))
+    print(f"[Issue tag] {n} view(s) tagged -> {store.root / 'issues.json'}. Next: `fix`.")
+
+
+def cmd_fix(store, args):
+    """
+    One Gemini call per view tagged in issue-tag: the current dataset image
+    (+ a copy with the painted area outlined in red), prompt built from the
+    tags and note. The response is blended back inside the painted area only
+    (whole response if nothing was painted). Skips views already fixed with
+    the same tags/note/region unless --redo.
+    """
+    issues = load_issues(store)
+    todo = []
+    for d, m in _select_ids(accepted_candidates(store), args.ids):
+        e = issues.get(cand_key(m))
+        if not e or not e.get("tags"):
+            continue
+        region_p = d / "09r_region.png"
+        region = cv2.imread(str(region_p), cv2.IMREAD_GRAYSCALE) if region_p.exists() else None
+        has_region = region is not None and cv2.countNonZero(region) > 0
+        prompt = build_fix_prompt(e["tags"], e.get("note", ""), has_region)
+        sig = {"tags": e["tags"], "note": e.get("note", ""),
+               "region_mtime": region_p.stat().st_mtime if has_region else None}
+        old = json.loads((d / "09_fix.json").read_text(encoding="utf-8")) \
+            if (d / "09_fix.json").exists() else {}
+        if not args.redo and (d / "09d_response.png").exists() and old.get("sig") == sig:
+            continue
+        todo.append((d, m, region if has_region else None, prompt, sig))
+    if args.limit:
+        todo = todo[:args.limit]
+    print(f"[Fix] {len(todo)} view(s) -> {len(todo)} Gemini call(s).")
+    if not todo:
+        return
+    if args.show_prompt:
+        print("--- prompt of the first view ---\n" + todo[0][3] + "\n---")
+    if not args.yes and input("Proceed? (y/N): ").strip().lower() not in ("y", "yes"):
+        return
+
+    def one(d, region, prompt, sig):
+        # The input is the image before any fix, so a redo never stacks fixes.
+        base_p = d / "09a_input.png"
+        base = cv2.imread(str(base_p)) if base_p.exists() else cv2.imread(str(current_image(d)))
+        imgs = [base] + ([mark_region(base, region)] if region is not None else [])
+        resp = gemini_fix(imgs, prompt)
+        if resp is None:
+            return False
+        for f in FIX_FILES:
+            if f != "09a_input.png":
+                (d / f).unlink(missing_ok=True)
+        cv2.imwrite(str(base_p), base)
+        if region is not None:
+            cv2.imwrite(str(d / "09b_marked.png"), imgs[1])
+            cv2.imwrite(str(d / "09c_region.png"), region)
+        cv2.imwrite(str(d / "09d_response.png"), resp)
+        (d / "09_fix.json").write_text(json.dumps({"sig": sig, "prompt": prompt}, indent=2,
+                                                  ensure_ascii=False), encoding="utf-8")
+        write_fix_result(d, "region" if region is not None else "full")
+        return True
+
+    ok = fail = 0
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = {ex.submit(one, d, r, p, s): m for d, m, r, p, s in todo}
+        for i, fut in enumerate(as_completed(futs), 1):
+            m = futs[fut]
+            try:
+                good = fut.result()
+            except Exception as e:
+                print(f"  {cand_key(m)}: {e!r}")
+                good = False
+            ok += good
+            fail += not good
+            print(f"  [{i}/{len(todo)}] {cand_key(m)}: {'fixed' if good else 'FAILED'}")
+    print(f"[Fix] fixed {ok}, failed {fail}. Re-run to retry failures; check with `fix-view`.")
+
+
+def cmd_unfix(store, args):
+    """Remove the fix of the given views (back to the image before it)."""
+    n = 0
+    for d, m in _select_ids(store.candidates(), args.ids):
+        if (d / "09_final_fix.png").exists() or (d / "09d_response.png").exists():
+            n += 1
+        for f in FIX_FILES:
+            (d / f).unlink(missing_ok=True)
+    print(f"[Unfix] removed {n} fix(es).")
+
+
+def cmd_fix_view(store, args):
+    """
+    Check the fixes: before | Gemini response | result in the dataset.
+      1 = use region blend   2 = use Gemini full image   3 = revert (keep before)
+      (each saves and goes to the next)
+      space / n = next   b = back   z = zoom to the painted area / whole image
+      q = quit
+    """
+    import tkinter as tk
+    from PIL import Image, ImageTk
+
+    items = [(d, m) for d, m in _select_ids(accepted_candidates(store), args.ids)
+             if (d / "09d_response.png").exists()]
+    if not items:
+        print("[Fix view] No fixed views yet (run `fix`).")
+        return
+    issues = load_issues(store)
+    root = tk.Tk()
+    root.geometry("+0+0")
+    scr_w, scr_h = root.winfo_screenwidth(), root.winfo_screenheight()
+    pane_w, pane_h = (scr_w - 40) // 3, scr_h - 230
+    top = tk.Frame(root)
+    top.pack()
+    panes, frames = [], []
+    for title in ("before", "[2] Gemini response (full)", "[1] region blend"):
+        col = tk.Frame(top, highlightthickness=5, highlightbackground="#444")
+        col.pack(side=tk.LEFT, padx=3)
+        tk.Label(col, text=title, font=("Arial", 11, "bold")).pack()
+        c = tk.Canvas(col, width=pane_w, height=pane_h, bg="black", highlightthickness=0)
+        c.pack()
+        panes.append(c)
+        frames.append(col)
+    status = tk.Label(root, font=("Arial", 12, "bold"))
+    status.pack(pady=(4, 0))
+    tag_line = tk.Label(root, font=("Arial", 10))
+    tag_line.pack()
+    tk.Label(root, font=("Arial", 10), text=(
+        "1 = region blend    2 = Gemini full    3 = revert (keep before)    space = next    "
+        "b = back    z = zoom to painted area    q = quit")).pack(pady=(0, 4))
+    pos, zoom = [0], [False]
+    cache = {}
+
+    def info(d):
+        p = d / "09_fix.json"
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+    def imgs(d):
+        if d not in cache:
+            cache.clear()
+            base = cv2.imread(str(d / "09a_input.png"))
+            resp = cv2.imread(str(d / "09d_response.png"))
+            rp = d / "09c_region.png"
+            region = cv2.imread(str(rp), cv2.IMREAD_GRAYSCALE) if rp.exists() else None
+            blend = blend_region(base, resp, region) if region is not None else resp
+            cache[d] = (base, resp, blend, region)
+        return cache[d]
+
+    def put(canvas, bgr):
+        h, w = bgr.shape[:2]
+        sc = min(pane_w / w, pane_h / h)
+        disp = cv2.resize(bgr, (max(1, int(w * sc)), max(1, int(h * sc))),
+                          interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_NEAREST)
+        img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)))
+        canvas._img = img
+        canvas.delete("all")
+        canvas.create_image(pane_w // 2, pane_h // 2, image=img)
+
+    def show():
+        d, m = items[pos[0]]
+        base, resp, blend, region = imgs(d)
+        h, w = base.shape[:2]
+        crop = (slice(0, h), slice(0, w))
+        if zoom[0] and region is not None and cv2.countNonZero(region):
+            x, y, bw, bh = cv2.boundingRect(region)
+            pad = max(40, int(0.3 * max(bw, bh)))
+            crop = (slice(max(0, y - pad), min(h, y + bh + pad)),
+                    slice(max(0, x - pad), min(w, x + bw + pad)))
+        shown = [base, resp, blend]
+        if region is not None:
+            shown[0] = mark_region(base, region)
+        for c, im in zip(panes, shown):
+            put(c, im[crop])
+        mode = info(d).get("merge")
+        for f, md in zip(frames, (None, "full", "region")):
+            f.config(highlightbackground="#2e9e4f" if mode == md and md else "#444")
+        e = issues.get(cand_key(m), {})
+        status.config(text=f"[{pos[0] + 1}/{len(items)}]  {cand_key(m)}   in dataset: "
+                           f"{ {'region': 'region blend', 'full': 'Gemini full', 'revert': 'before (reverted)'}.get(mode, mode)}"
+                           f"   view: {'painted area' if zoom[0] else 'whole image'}")
+        tag_line.config(text=f"tags: {', '.join(e.get('tags', []))}    note: {e.get('note', '')}")
+        root.title(f"Fix view — {cand_key(m)}")
+
+    def go(step):
+        pos[0] = min(max(0, pos[0] + step), len(items) - 1)
+        zoom[0] = False
+        show()
+
+    def choose(mode):
+        d, _ = items[pos[0]]
+        if mode == "region" and not (d / "09c_region.png").exists():
+            mode = "full"
+        write_fix_result(d, mode)
+        if pos[0] + 1 < len(items):
+            go(1)
+        else:
+            show()
+
+    def on_key(e):
+        k = e.keysym.lower()
+        if k in ("1", "kp_1"):
+            choose("region")
+        elif k in ("2", "kp_2"):
+            choose("full")
+        elif k in ("3", "kp_3"):
+            choose("revert")
+        elif k in ("space", "return", "n"):
+            go(1)
+        elif k == "b":
+            go(-1)
+        elif k == "z":
+            zoom[0] = not zoom[0]
+            show()
+        elif k == "q":
+            root.destroy()
+
+    root.bind("<Key>", on_key)
+    show()
+    root.lift()
+    root.attributes("-topmost", True)
+    root.after(400, lambda: root.attributes("-topmost", False))
+    root.focus_force()
+    root.mainloop()
+    modes = [info(d).get("merge") for d, _ in items]
+    print(f"[Fix view] region {modes.count('region')}, full {modes.count('full')}, "
+          f"reverted {modes.count('revert')}. Run `finalize` to update the dataset.")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  5. STATS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2437,6 +3079,8 @@ def cmd_finalize(store, args):
             lab = label_of(m)
             views.append({
                 "view_id": vid, "kind": "generated", "repair": repair,
+                "fix": (load_issues(store).get(cand_key(m), {}).get("tags")
+                        if (d / "09_final_fix.png").exists() else None),
                 **gaze_fields(lab["gaze"]), "label_source": lab["source"],
                 "face_px": lab["face_px"], "target_px": lab["target_px"],
                 "face_depth": lab["face_depth"], "target_depth": lab["target_depth"],
@@ -2589,6 +3233,25 @@ def main():
     p.add_argument("--ids", nargs="+", metavar="ID")
     p.add_argument("--all", action="store_true", help="start from the first view, not the first unpicked")
 
+    p = sub.add_parser("issue-tag", help="tag problems (implausible / artifact / seam) + paint the area")
+    p.add_argument("--ids", nargs="+", metavar="ID")
+    p.add_argument("--unpicked", action="store_true",
+                   help="add Gemini-repaired views not picked in merge-select")
+
+    p = sub.add_parser("fix", help="targeted Gemini fix of the views tagged in issue-tag")
+    p.add_argument("--ids", nargs="+", metavar="ID")
+    p.add_argument("--redo", action="store_true", help="fix again even if unchanged")
+    p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--workers", type=int, default=3)
+    p.add_argument("--yes", action="store_true")
+    p.add_argument("--show-prompt", action="store_true", help="print the first prompt before asking")
+
+    p = sub.add_parser("fix-view", help="before | Gemini response | result; pick region / full / revert")
+    p.add_argument("--ids", nargs="+", metavar="ID")
+
+    p = sub.add_parser("unfix", help="remove the targeted fix of some views")
+    p.add_argument("ids", nargs="+", metavar="ID")
+
     p = sub.add_parser("unrepair", help="drop the Gemini repair of some samples (back to inpaint)")
     p.add_argument("ids", nargs="+", metavar="ID")
 
@@ -2604,6 +3267,7 @@ def main():
      "stats": cmd_stats, "gallery": cmd_gallery, "label-source": cmd_label_source,
      "repair-select": cmd_repair_select, "repair": cmd_repair, "remerge": cmd_remerge,
      "repair-view": cmd_repair_view, "merge-select": cmd_merge_select, "unrepair": cmd_unrepair,
+     "issue-tag": cmd_issue_tag, "fix": cmd_fix, "fix-view": cmd_fix_view, "unfix": cmd_unfix,
      "finalize": cmd_finalize}[args.cmd](store, args)
 
 
