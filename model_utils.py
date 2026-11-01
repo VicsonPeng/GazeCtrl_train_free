@@ -264,6 +264,24 @@ def composite_onto_background(original_bgr, gemini_bgr, person_mask, return_fg=F
     gem[marker > 0] = 0
     fg = foreground_mask(gem, person_mask)
 
+    # Very dark clothing/hair (max channel 4-8) is under the foreground
+    # threshold, so a dark hoodie came out as holes that the repair pass then
+    # filled with *background*. Add such pixels back where they're plausibly
+    # the person: inside the original person's area and connected to the
+    # foreground. Pure-black holes (<= 3) and floating noise specks in the
+    # vacated area stay out and are left to the gap repair.
+    ell = lambda n: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (n, n))
+    dark = ((gem.max(axis=2) > 3)
+            & (cv2.dilate((person_mask > 0).astype(np.uint8), ell(15)) > 0)).astype(np.uint8) * 255
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, ell(5))
+    union = cv2.bitwise_or(fg, dark)
+    n, labels = cv2.connectedComponents(union, connectivity=8)
+    if n > 1:
+        touches = np.zeros(n, bool)
+        touches[np.unique(labels[fg > 0])] = True
+        touches[0] = False
+        fg = np.where(touches[labels], 255, 0).astype(np.uint8)
+
     # Marker drawn over the person: patch it from the surrounding person pixels.
     on_person = cv2.bitwise_and(marker, fg)
     if cv2.countNonZero(on_person):

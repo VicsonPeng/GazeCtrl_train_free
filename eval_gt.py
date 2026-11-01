@@ -25,8 +25,11 @@ Workflow (each stage is a subcommand; all state lives under --data):
                result with label direction, filterable; defaults to accepted.
   -> repeat plan/run/review with --round 2, 3, ... until bins are filled.
      label-source  Label the gaze of the person in each source photo.
+     repair-select  Inspect each accepted view's inpaint gap fill (Gemini
+               output | inpaint result | gap close-up), mark the bad ones.
   6. repair    Gemini gap repair for accepted candidates only (replaces the
-               screening inpaint); `unrepair` reverts individual samples.
+               screening inpaint; --selected = only the marked ones);
+               `unrepair` reverts individual samples.
      finalize  Exports final/ as scenes: every labelled view of each person
                (original + accepted edits) with its own mask; any two views
                of a scene form a pair (no API calls).
@@ -1272,9 +1275,162 @@ def gt_image(cdir):
     return (g, "gemini") if g.exists() else (cdir / "07_final_inpaint.png", "inpaint")
 
 
+def load_repair_selection(store):
+    p = store.root / "repair_selection.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+
+def save_repair_selection(store, sel):
+    p = store.root / "repair_selection.json"
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(sel, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(p)
+
+
+def cmd_repair_select(store, args):
+    """
+    Inspect every accepted view's gap fill and mark the ones that need a
+    Gemini repair. Panes: Gemini output | composite after inpaint (gap
+    outlined) | close-up of the gap area.
+      x = needs Gemini fix   space / Enter = inpaint is fine   b = back
+      o = toggle gap outline   z = close-up of the next gap region   q = quit
+    Saved to <data>/repair_selection.json; then `repair --selected`.
+    """
+    import tkinter as tk
+    from PIL import Image, ImageTk
+
+    sel = load_repair_selection(store)
+    items = accepted_candidates(store)
+    if args.images:
+        items = [(d, m) for d, m in items if m["image"] in set(args.images)]
+    if not args.all:
+        items = [(d, m) for d, m in items if cand_key(m) not in sel]
+    if not items:
+        print("[Repair select] Nothing to inspect (use --all to revisit).")
+        return
+    print(f"[Repair select] {len(items)} view(s).")
+
+    root = tk.Tk()
+    root.geometry("+0+0")
+    scr_w, scr_h = root.winfo_screenwidth(), root.winfo_screenheight()
+    pane_w, pane_h = (scr_w - 30) // 3, scr_h - 200
+    top = tk.Frame(root)
+    top.pack()
+    panes = []
+    for title in ("Gemini output", "after inpaint (gap outlined)", "gap close-up"):
+        col = tk.Frame(top)
+        col.pack(side=tk.LEFT, padx=2)
+        tk.Label(col, text=title, font=("Arial", 10, "bold")).pack()
+        c = tk.Canvas(col, width=pane_w, height=pane_h, bg="black")
+        c.pack()
+        panes.append(c)
+    status = tk.Label(root, font=("Arial", 12, "bold"))
+    status.pack(pady=(4, 0))
+    tk.Label(root, font=("Arial", 10), text=(
+        "x = needs Gemini fix    space / Enter = inpaint OK    b = back    "
+        "o = toggle outline    z = next gap close-up    q = quit")).pack(pady=(0, 4))
+
+    pos = [0]
+    view = {"outline": True, "zoom": 0}
+
+    def put(canvas, bgr):
+        h, w = bgr.shape[:2]
+        sc = min(pane_w / w, pane_h / h)
+        disp = cv2.resize(bgr, (max(1, int(w * sc)), max(1, int(h * sc))),
+                          interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_LINEAR)
+        img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)))
+        canvas._img = img
+        canvas.delete("all")
+        canvas.create_image(pane_w // 2, pane_h // 2, image=img)
+
+    def show():
+        d, m = items[pos[0]]
+        raw = cv2.imread(str(d / "05_gemini_raw.png"))
+        fin = cv2.imread(str(d / "07_final_inpaint.png"))
+        gap = cv2.imread(str(d / "06b_gap_mask.png"), cv2.IMREAD_GRAYSCALE)
+        h, w = fin.shape[:2]
+        shown = fin.copy()
+        if view["outline"] and gap is not None and cv2.countNonZero(gap):
+            cnts, _ = cv2.findContours(gap, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(shown, cnts, -1, (255, 0, 255), max(1, w // 600))
+        put(panes[0], raw)
+        put(panes[1], shown)
+        zinfo = ""
+        if gap is not None and cv2.countNonZero(gap):
+            # Close-up of one gap region at a time, largest first (z cycles):
+            # the gap is usually a thin rim around the whole person plus one
+            # or two real holes the pose change opened, which is where
+            # inpainting fails.
+            n, _, stats, _ = cv2.connectedComponentsWithStats(gap, connectivity=8)
+            order = 1 + np.argsort(-stats[1:, cv2.CC_STAT_AREA])
+            i = int(order[view["zoom"] % len(order)])
+            x, y, bw, bh = stats[i, :4]
+            pad = max(40, int(0.6 * max(bw, bh)), int(0.04 * max(h, w)))
+            x0, x1 = max(0, x - pad), min(w, x + bw + pad)
+            y0, y1 = max(0, y - pad), min(h, y + bh + pad)
+            put(panes[2], shown[y0:y1, x0:x1])
+            pct = cv2.countNonZero(gap) / gap.size * 100
+            zinfo = f"   close-up {view['zoom'] % len(order) + 1}/{len(order)} (z = next)"
+        else:
+            panes[2].delete("all")
+            pct = 0.0
+        marked = sum(v == "fix" for v in sel.values())
+        cur = sel.get(cand_key(m), "—")
+        status.config(text=(f"[{pos[0] + 1}/{len(items)}]  {cand_key(m)}   gap {pct:.2f}%   "
+                            f"current: {cur}   marked for fix: {marked}{zinfo}"),
+                      fg="red" if cur == "fix" else "black")
+        root.title(f"Repair select — {cand_key(m)}")
+
+    def step(delta):
+        pos[0] += delta
+        view["zoom"] = 0
+        if pos[0] >= len(items):
+            print("[Repair select] Reached the end.")
+            root.destroy()
+            return
+        pos[0] = max(0, pos[0])
+        show()
+
+    def on_key(e):
+        k = e.keysym.lower()
+        m = items[pos[0]][1]
+        if k == "x":
+            sel[cand_key(m)] = "fix"
+            save_repair_selection(store, sel)
+            step(1)
+        elif k in ("space", "return"):
+            sel[cand_key(m)] = "ok"
+            save_repair_selection(store, sel)
+            step(1)
+        elif k == "b":
+            step(-1)
+        elif k == "o":
+            view["outline"] = not view["outline"]
+            show()
+        elif k == "z":
+            view["zoom"] += 1
+            show()
+        elif k == "q":
+            root.destroy()
+
+    root.bind("<Key>", on_key)
+    show()
+    root.lift()
+    root.attributes("-topmost", True)                 # open in front of the editor
+    root.after(400, lambda: root.attributes("-topmost", False))
+    root.focus_force()
+    root.mainloop()
+    n_fix = sum(v == "fix" for v in sel.values())
+    print(f"[Repair select] {len(sel)} inspected, {n_fix} marked for Gemini fix "
+          f"-> `python eval_gt.py repair --selected` ({n_fix} Gemini call(s)).")
+
+
 def cmd_repair(store, args):
     """Gemini gap repair (replacing the screening inpaint) for accepted candidates."""
     accepted = accepted_candidates(store)
+    if args.selected:
+        marked = {k for k, v in load_repair_selection(store).items() if v == "fix"}
+        accepted = [(d, m) for d, m in accepted if cand_key(m) in marked]
     if args.ids:
         want = set(args.ids)
         accepted = [(d, m) for d, m in accepted if cand_key(m) in want
@@ -1282,7 +1438,7 @@ def cmd_repair(store, args):
     todo = []
     small = 0
     for d, m in accepted:
-        if (d / "08_final_gemini.png").exists() and not args.ids:
+        if (d / "08_final_gemini.png").exists() and not (args.ids or args.redo):
             continue
         gap = cv2.imread(str(d / "06b_gap_mask.png"), cv2.IMREAD_GRAYSCALE)
         if gap is None:
@@ -1964,7 +2120,14 @@ def main():
     p.add_argument("--images", nargs="+", metavar="STEM")
     p.add_argument("--all", action="store_true", help="include already-labelled images")
 
+    p = sub.add_parser("repair-select", help="inspect gap fills, mark views for Gemini repair")
+    p.add_argument("--images", nargs="+", metavar="STEM")
+    p.add_argument("--all", action="store_true", help="include already-inspected views")
+
     p = sub.add_parser("repair", help="Gemini gap repair for accepted candidates")
+    p.add_argument("--selected", action="store_true",
+                   help="only views marked 'fix' in repair-select")
+    p.add_argument("--redo", action="store_true", help="repair again even if already repaired")
     p.add_argument("--min-gap-pct", type=float, default=0.0,
                    help="keep inpaint when the gap is below this %% of the image")
     p.add_argument("--ids", nargs="+", metavar="ID",
@@ -1986,7 +2149,7 @@ def main():
     {"prep": cmd_prep, "plan": cmd_plan, "run": cmd_run, "recomposite": cmd_recomposite,
      "review": cmd_review,
      "stats": cmd_stats, "gallery": cmd_gallery, "label-source": cmd_label_source,
-     "repair": cmd_repair, "unrepair": cmd_unrepair,
+     "repair-select": cmd_repair_select, "repair": cmd_repair, "unrepair": cmd_unrepair,
      "finalize": cmd_finalize}[args.cmd](store, args)
 
 

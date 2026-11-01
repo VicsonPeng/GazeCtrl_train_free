@@ -324,7 +324,8 @@ python eval_gt.py stats                             # accepted count per yaw x p
 python eval_gt.py gallery                           # HTML overview of everything -> ../eval_dataset/gallery/index.html
 python eval_gt.py plan --round 2 --per-image 4      # next round favours bins that are still empty
 python eval_gt.py label-source                      # label the gaze of the person in each source photo
-python eval_gt.py repair --min-gap-pct 0.2          # Gemini gap repair for accepted only (unrepair ID to revert)
+python eval_gt.py repair-select                     # inspect inpaint gap fills, x = needs Gemini fix
+python eval_gt.py repair --selected                 # Gemini gap repair for the marked views only (unrepair ID to revert)
 python eval_gt.py finalize                          # export final/ as scenes of labelled views (no API calls)
 ```
 
