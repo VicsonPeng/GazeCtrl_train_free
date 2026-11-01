@@ -2403,7 +2403,10 @@ def cmd_fix(store, args):
             sig["ref_original"] = True
         old = json.loads((d / "09_fix.json").read_text(encoding="utf-8")) \
             if (d / "09_fix.json").exists() else {}
-        if not args.redo and (d / "09d_response.png").exists() and old.get("sig") == sig:
+        old_sig = dict(old.get("sig") or {})
+        if not args.ref_original:          # a plain `fix` doesn't redo --ref-original fixes
+            old_sig.pop("ref_original", None)
+        if not args.redo and (d / "09d_response.png").exists() and old_sig == sig:
             continue
         todo.append((d, m, region if has_region else None, e, sig))
     if args.limit:
