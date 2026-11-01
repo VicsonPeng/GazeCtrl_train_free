@@ -328,8 +328,20 @@ python eval_gt.py repair-select                     # inspect inpaint gap fills,
 python eval_gt.py repair --selected                 # Gemini gap repair for the marked views only (unrepair ID to revert)
 python eval_gt.py repair-view                       # sent image | Gemini's full response | merged result
 python eval_gt.py remerge --merge full              # recombine saved responses: feather (default) | full | gap
+python eval_gt.py merge-select                      # per view: Gemini full image (1/g) or feather merge (2/f)
+python eval_gt.py issue-tag --unpicked              # still bad? tag implausible / artifact / seam, paint the area, add a note
+python eval_gt.py fix --show-prompt                 # targeted Gemini fix from the tags (--ref-original: send the source photo too)
+python eval_gt.py fix-view                          # before | response | region blend; 1 region, 2 full, 3 revert (unfix ID)
 python eval_gt.py finalize                          # export final/ as scenes of labelled views (no API calls)
+python eval_gt.py face-check                        # insightface: flag label face points that are off the face
+python eval_gt.py face-fix                          # move them (a = detected eyes, click = manual); target moves along
+python eval_gt.py finalize
+python eval_gt.py export-hf --repo user/GazeCtrl-Eval   # upload-ready HF folder + dataset card -> ../eval_dataset/release
 ```
+
+The released set is [baki0115/GazeCtrl-Eval](https://huggingface.co/datasets/baki0115/GazeCtrl-Eval)
+(50 scenes, 360 views, 2414 pairs); loader and evaluation script:
+[GazeCtrl-Eval](https://github.com/VicsonPeng/GazeCtrl-Eval).
 
 Data lives in `../eval_dataset/` (`raw/` in; `prep/`, `candidates/`,
 `reviews.json`, `final/` out). Bins are 12 yaw (centred on −180…150, 30°
@@ -366,6 +378,22 @@ either direction. `views.csv` lists views (`kind` = original / generated,
 `manifest.json` everything. Generated views use the Gemini gap repair when
 `repair` produced one, else the screening inpaint; their masks are the
 edited person's silhouette (dark clothing filled in, enclosed holes filled).
+
+Repairs, in order of escalation: the thin rim of the gap is filled locally
+and only real holes go to Gemini; its full response is saved and merged with
+`feather` (holes plus the old person's fringe, tone and grain matched to the
+surroundings, feathered edge), or taken whole where that looks better
+(`merge-select`). Views still wrong get a targeted pass: the prompt is built
+from the reviewer's tags and note, the painted area is outlined in red on a
+second guide image, and the response is aligned and blended back inside that
+area only. If Gemini copies the red outline into its output, the call is
+retried without the guide. The fix always starts from the image before any
+fix, so redoing it never stacks edits.
+
+Edits often move the head while the label keeps the source face point.
+`face-check` compares every label's face point with the eye midpoint from a
+face detector; `face-fix` moves flagged points and shifts the target by the
+same 2D offset, so the gaze arrow approved in review keeps its direction.
 
 ## Notes & limitations
 
