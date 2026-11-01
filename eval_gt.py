@@ -1447,14 +1447,64 @@ def split_gap(composite, gap):
     return pre, holes
 
 
-def merge_repair(base, response, holes, mode):
+def blend_repair(base, response, holes, person, old_mask, grow=7, band=8):
+    """
+    Seamless merge of Gemini's repair into the pre-filled composite.
+
+    Taking only the hole pixels left dark seams. The cause was mostly outside
+    the holes: the old person's anti-aliased fringe (hair wisps the SAM mask
+    missed) stays in the original background around the hole, while Gemini
+    repaints it clean. So:
+      1. take Gemini's pixels in the holes *and* the old person's fringe
+         around them (grown by `grow` px, never onto the new person);
+      2. correct Gemini's slight tone shift (~1-2 levels) with a smooth
+         per-pixel offset estimated from a ring of original pixels around it;
+      3. add back grain where Gemini is smoother than the photo;
+      4. fade into the original over `band` px, and give the pasted person an
+         anti-aliased edge (blended on the inside of its silhouette only, so
+         the black holes next to it never leak in).
+    Pixels away from the holes stay the original's, unlike taking Gemini's
+    whole image, which also changes the surrounding scene.
+    """
+    ell = lambda n: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (n, n))
+    near_old = cv2.dilate(old_mask, ell(2 * grow + 9))
+    grown = (cv2.dilate(holes, ell(2 * grow + 1)) & near_old
+             & cv2.bitwise_not(cv2.dilate(person, ell(5))))
+    region = cv2.bitwise_or(holes, grown)
+
+    ring = ((cv2.dilate(region, ell(41)) > 0) & (region == 0)
+            & (cv2.dilate(person, ell(5)) == 0))
+    w = ring.astype(np.float32)
+    num = cv2.GaussianBlur((base.astype(np.float32) - response.astype(np.float32)) * w[..., None],
+                           (0, 0), 25)
+    den = cv2.GaussianBlur(w, (0, 0), 25)[..., None]
+    resp = response.astype(np.float32) + np.where(den > 1e-3, num / np.maximum(den, 1e-3), 0)
+
+    if ring.any():
+        hf = lambda im: (lambda g: (g - cv2.GaussianBlur(g, (0, 0), 1.2))[ring].std())(
+            cv2.cvtColor(im, cv2.COLOR_BGR2GRAY).astype(np.float32))
+        add = float(np.sqrt(max(0.0, hf(base) ** 2 - hf(response) ** 2)))
+        if add > 0:
+            noise = np.random.default_rng(0).normal(0, add, base.shape[:2]).astype(np.float32)
+            resp += noise[..., None]
+
+    dist = cv2.distanceTransform((region == 0).astype(np.uint8), cv2.DIST_L2, 5)
+    alpha = np.clip(1 - dist / band, 0, 1)
+    alpha[holes > 0] = 1
+    keep = np.clip(cv2.GaussianBlur((person > 0).astype(np.float32), (0, 0), 1.0) * 2 - 1, 0, 1)
+    alpha = (alpha * (1 - keep))[..., None]
+    out = alpha * resp + (1 - alpha) * base.astype(np.float32)
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+
+
+def merge_repair(base, response, holes, mode, person=None, old_mask=None):
     """
     Combine Gemini's repair response with the pre-filled composite.
-      feather: Gemini pixels in the holes, blended into the surroundings over
-               a ~8 px band so there is no hard seam (default)
-      full:    Gemini's whole image (no seams, but the whole frame becomes its
-               1K output upscaled and it may have touched the person)
-      gap:     Gemini pixels in the holes only, hard edge (previous behaviour)
+      feather: blend_repair — holes + old-person fringe, tone/grain matched,
+               feathered edges; the rest of the scene stays original (default)
+      full:    Gemini's whole image (no seams, but the scene around can change,
+               the frame becomes its 1K output upscaled, and it may touch the person)
+      gap:     Gemini pixels in the holes only, hard edge (first version)
     """
     if mode == "full":
         return response.copy()
@@ -1463,26 +1513,39 @@ def merge_repair(base, response, holes, mode):
         m = cv2.dilate(holes, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
         out[m > 0] = response[m > 0]
         return out
-    band = cv2.dilate(holes, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)))
-    alpha = cv2.GaussianBlur((band > 0).astype(np.float32), (0, 0), 4)
-    alpha = np.maximum(alpha, (holes > 0).astype(np.float32))[..., None]
-    out = alpha * response.astype(np.float32) + (1 - alpha) * base.astype(np.float32)
-    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+    return blend_repair(base, response, holes, person, old_mask)
+
+
+def repair_context(d):
+    """(person mask of this view, original person mask) for blend_repair."""
+    name = d.parent.name
+    prep = d.parent.parent.parent / "prep" / name
+    old_mask = cv2.imread(str(prep / "mask.png"), cv2.IMREAD_GRAYSCALE)
+    cached = d / "08d_person.png"
+    if cached.exists():
+        return cv2.imread(str(cached), cv2.IMREAD_GRAYSCALE), old_mask
+    image = cv2.imread(str(prep / "image.png"))
+    raw = cv2.imread(str(d / "05_gemini_raw.png"))
+    _, _, person = composite_onto_background(image, raw, old_mask, return_fg=True)
+    cv2.imwrite(str(cached), person)
+    return person, old_mask
 
 
 REPAIR_FILES = ("08_final_gemini.png", "08a_sent.png", "08b_gemini_response.png",
-                "08c_holes.png", "08_repair.json")
+                "08c_holes.png", "08d_person.png", "08_repair.json")
 
 
 def write_repair_result(d, mode):
     """(Re)build 08_final_gemini.png from the saved send/response files."""
     base = cv2.imread(str(d / "08a_sent.png"))
     holes = cv2.imread(str(d / "08c_holes.png"), cv2.IMREAD_GRAYSCALE)
-    resp = cv2.imread(str(d / "08b_gemini_response.png"))
+    rp = d / "08b_gemini_response.png"
+    resp = cv2.imread(str(rp)) if rp.exists() else None
     if resp is None:                                   # rim only: no Gemini call was needed
         out = base
     else:
-        out = merge_repair(base, resp, holes, mode)
+        person, old_mask = repair_context(d) if mode == "feather" else (None, None)
+        out = merge_repair(base, resp, holes, mode, person, old_mask)
     cv2.imwrite(str(d / "08_final_gemini.png"), out)
     (d / "08_repair.json").write_text(json.dumps(
         {"merge": mode if resp is not None else "rim-only (TELEA)",
