@@ -1995,13 +1995,22 @@ def current_image(d):
     return g if g.exists() else d / "07_final_inpaint.png"
 
 
-def build_fix_prompt(tags, note, has_region):
+def build_fix_prompt(tags, note, has_region, ref_original=False):
+    """
+    has_region: a 2nd image with the area outlined in red is sent as a guide.
+    ref_original: the last image is the original photo, as a reference for
+    objects lost in the edit (e.g. what the person was holding).
+    """
     where = "the area outlined in red in the second image" if has_region else "the image"
     parts = [
         "The first image is a photograph that needs a local fix. "
         + ("The second image is the same photograph with the area to fix outlined in red; "
            "it is only a guide, and the red outline must NOT appear in your output. "
-           if has_region else ""),
+           if has_region else "")
+        + ("The last image is the original photo before the person was edited. Use it ONLY as "
+           "a reference for objects and details that went missing (for example what the person "
+           "holds); do NOT copy the person's head pose or gaze from it. "
+           if ref_original else ""),
         f"Edit {where}:",
     ]
     parts += [f"- {ISSUE_PROMPTS[t]}" for t in tags if t in ISSUE_PROMPTS]
@@ -2014,6 +2023,18 @@ def build_fix_prompt(tags, note, has_region):
         + "Keep the framing, composition, lighting and colours of the photograph identical, "
           "and return the whole photograph at the same aspect ratio.")
     return "\n".join(parts)
+
+
+def guide_leaked(base, resp, min_area=300):
+    """True if Gemini copied the red guide outline into its output: a new blob
+    of pure red (natural red objects are orange-ish or already in the input)."""
+    def pure(im):
+        b, g, r = [im[..., i].astype(int) for i in range(3)]
+        return (r >= 160) & (g <= 80) & (b <= 80) & (r - np.maximum(g, b) >= 120)
+    old = cv2.dilate(pure(base).astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
+    new = (pure(resp) & ~old).astype(np.uint8)
+    n, _, st, _ = cv2.connectedComponentsWithStats(new, connectivity=8)
+    return n > 1 and int(st[1:, cv2.CC_STAT_AREA].max()) >= min_area
 
 
 def mark_region(image, region):
@@ -2376,14 +2397,15 @@ def cmd_fix(store, args):
         region_p = d / "09r_region.png"
         region = cv2.imread(str(region_p), cv2.IMREAD_GRAYSCALE) if region_p.exists() else None
         has_region = region is not None and cv2.countNonZero(region) > 0
-        prompt = build_fix_prompt(e["tags"], e.get("note", ""), has_region)
         sig = {"tags": e["tags"], "note": e.get("note", ""),
                "region_mtime": region_p.stat().st_mtime if has_region else None}
+        if args.ref_original:
+            sig["ref_original"] = True
         old = json.loads((d / "09_fix.json").read_text(encoding="utf-8")) \
             if (d / "09_fix.json").exists() else {}
         if not args.redo and (d / "09d_response.png").exists() and old.get("sig") == sig:
             continue
-        todo.append((d, m, region if has_region else None, prompt, sig))
+        todo.append((d, m, region if has_region else None, e, sig))
     if args.limit:
         todo = todo[:args.limit]
     if untagged:
@@ -2393,16 +2415,32 @@ def cmd_fix(store, args):
     if not todo:
         return
     if args.show_prompt:
-        print("--- prompt of the first view ---\n" + todo[0][3] + "\n---")
+        _, _, r0, e0, _ = todo[0]
+        print("--- prompt of the first view ---\n"
+              + build_fix_prompt(e0["tags"], e0.get("note", ""), r0 is not None, args.ref_original)
+              + "\n---")
     if not args.yes and input("Proceed? (y/N): ").strip().lower() not in ("y", "yes"):
         return
 
-    def one(d, region, prompt, sig):
+    def one(d, m, region, e, sig):
         # The input is the image before any fix, so a redo never stacks fixes.
         base_p = d / "09a_input.png"
         base = cv2.imread(str(base_p)) if base_p.exists() else cv2.imread(str(current_image(d)))
-        imgs = [base] + ([mark_region(base, region)] if region is not None else [])
+        ref = []
+        if args.ref_original:
+            orig = cv2.imread(str(store.prep / m["image"] / "image.png"))
+            ref = [cv2.resize(orig, (base.shape[1], base.shape[0]))]
+        guide = region is not None
+        prompt = build_fix_prompt(e["tags"], e.get("note", ""), guide, args.ref_original)
+        imgs = [base] + ([mark_region(base, region)] if guide else []) + ref
         resp = gemini_fix(imgs, prompt)
+        if resp is not None and guide and guide_leaked(base, resp):
+            # Gemini drew the red outline into the picture: ask again without the
+            # guide image; the result is still blended inside the painted area only.
+            print(f"  {cand_key(m)}: red guide leaked into the output -> retry without guide")
+            guide = False
+            prompt = build_fix_prompt(e["tags"], e.get("note", ""), False, args.ref_original)
+            resp = gemini_fix([base] + ref, prompt)
         if resp is None:
             return False
         for f in FIX_FILES:
@@ -2410,17 +2448,20 @@ def cmd_fix(store, args):
                 (d / f).unlink(missing_ok=True)
         cv2.imwrite(str(base_p), base)
         if region is not None:
-            cv2.imwrite(str(d / "09b_marked.png"), imgs[1])
+            if guide:
+                cv2.imwrite(str(d / "09b_marked.png"), imgs[1])
             cv2.imwrite(str(d / "09c_region.png"), region)
         cv2.imwrite(str(d / "09d_response.png"), resp)
-        (d / "09_fix.json").write_text(json.dumps({"sig": sig, "prompt": prompt}, indent=2,
-                                                  ensure_ascii=False), encoding="utf-8")
+        (d / "09_fix.json").write_text(json.dumps(
+            {"sig": sig, "prompt": prompt, "guide_sent": guide,
+             "red_leak": bool(guide_leaked(base, resp))}, indent=2,
+            ensure_ascii=False), encoding="utf-8")
         write_fix_result(d, "region" if region is not None else "full")
         return True
 
     ok = fail = 0
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(one, d, r, p, s): m for d, m, r, p, s in todo}
+        futs = {ex.submit(one, d, m, r, e, s): m for d, m, r, e, s in todo}
         for i, fut in enumerate(as_completed(futs), 1):
             m = futs[fut]
             try:
@@ -3250,6 +3291,8 @@ def main():
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--yes", action="store_true")
     p.add_argument("--show-prompt", action="store_true", help="print the first prompt before asking")
+    p.add_argument("--ref-original", action="store_true",
+                   help="also send the original photo as a reference for lost objects")
 
     p = sub.add_parser("fix-view", help="before | Gemini response | result; pick region / full / revert")
     p.add_argument("--ids", nargs="+", metavar="ID")
