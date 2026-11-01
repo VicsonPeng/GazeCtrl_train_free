@@ -3460,6 +3460,201 @@ def cmd_finalize(store, args):
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  7. EXPORT FOR HUGGING FACE
+# ══════════════════════════════════════════════════════════════════════════════
+
+HF_CARD = """---
+license: cc-by-nc-4.0
+pretty_name: __NAME__
+task_categories:
+- image-to-image
+tags:
+- gaze
+- gaze-redirection
+- image-editing
+- evaluation
+size_categories:
+- n<1K
+configs:
+- config_name: views
+  default: true
+  data_dir: views
+---
+
+# __NAME__
+
+An evaluation set for **gaze redirection / gaze-controlled image editing** on in-the-wild
+photos. Each *scene* is one photograph with one target person, plus several edited
+*views* of the same photo in which that person looks in a different, labelled 3D
+direction. Any two views of a scene form an evaluation pair (source -> target), in
+either direction.
+
+| | |
+|---|---|
+| scenes (source photos) | __N_SCENES__ |
+| views (incl. originals) | __N_VIEWS__ (__N_ORIG__ original + __N_GEN__ edited) |
+| ordered pairs | __N_PAIRS__ |
+| categories | __CATS__ |
+
+## How it was made
+
+1. 50 photos from [Pexels](https://www.pexels.com/), 10 categories x 5, not drawn from
+   COCO, SHHQ or WIDER FACE. One person per photo was segmented (SAM ViT-H) and given a
+   depth map (Depth-Anything-V2).
+2. For each person, target gazes were planned to cover the yaw/pitch range evenly. A
+   red dot (image position + depth) marked each 3D target; the person was edited with
+   Gemini (`gemini-3-pro-image-preview`) to look at it and composited back into the photo.
+3. Every edit was **reviewed by a person**. Edits were kept only if the result looked
+   natural; when the person in the result looked somewhere other than the requested
+   target, the label was **moved by hand to where the person actually looks** (2D target
+   point + relative depth). The gaze of every original photo was labelled the same way.
+4. Background holes left by the edit were filled (OpenCV inpainting, then a Gemini
+   repair pass where needed, blended back with tone/grain matching), and a final
+   targeted pass fixed views with implausible parts, artifacts or seams. Face points
+   were checked against a face detector (insightface).
+
+Labels are therefore **human judgements of the visible gaze**, not measurements.
+
+## Gaze convention
+
+Unit vector `(dx, dy, dz)` in camera space: `dx > 0` = image right, `dy > 0` = up,
+`dz > 0` = toward the camera. `yaw = atan2(dx, dz)` (0 = looking at the camera,
++-180 = looking away), `pitch = asin(dy)`. The label is computed from the face point
+and a 3D target (pixel + depth relative to the face) with a pinhole model, focal length
+0.8 x image width.
+
+__DIST__
+
+## Files
+
+```
+views/<scene>/<view_id>.png     view_id = "orig" or an edit id (r1_00, ...)
+views/metadata.csv              one row per view (labels; also drives the HF viewer)
+masks/<scene>/<view_id>.png     person mask of that view (0/255)
+pairs.csv                       every ordered pair within a scene + angle between gazes
+manifest.json                   scenes -> views, with labels, face/target points,
+                                requested target and the edit prompt
+```
+
+`views/metadata.csv` columns: `file_name, scene, category, view_id, kind
+(original|generated), dx, dy, dz, yaw_deg, pitch_deg, face_x, face_y, target_x,
+target_y, label_source (manual|requested), repair (null|gemini|inpaint), mask`.
+
+```python
+from datasets import load_dataset
+views = load_dataset("__REPO__", split="train")            # images + labels
+pairs = load_dataset("csv", data_files="hf://datasets/__REPO__/pairs.csv", split="train")
+```
+
+Or download the whole folder (`huggingface-cli download __REPO__ --repo-type dataset
+--local-dir GazeCtrl-Eval`) and read `manifest.json`.
+
+Images keep the resolution of the source (longest side 1500 px). Edited views may carry
+Gemini's SynthID watermark.
+
+## Limitations
+
+- Labels are manual and approximate (the depth component especially); compare methods
+  with an angular tolerance rather than exact agreement.
+- The distribution is skewed toward side views; a few yaw/pitch bins are empty.
+- Edited images are generated: hands, accessories and backgrounds may contain small
+  inconsistencies that were judged acceptable.
+
+## License and source images
+
+The edited views, masks and labels are released under **CC BY-NC 4.0**. The source
+photographs come from Pexels and remain under the
+[Pexels license](https://www.pexels.com/license/); they are included only to make the
+evaluation pairs usable. Do not use the images to identify, profile or portray the
+people shown in a negative way, and do not redistribute the photographs as stock images.
+If you appear in one of the photos and want it removed, please open a discussion on
+this repository.
+"""
+
+
+def cmd_export_hf(store, args):
+    """
+    Build an upload-ready Hugging Face dataset folder from final/ (run
+    `finalize` first). Layout: views/<scene>/<view>.png + views/metadata.csv,
+    masks/, pairs.csv, manifest.json, README.md (dataset card). No upload.
+    """
+    import csv
+    import shutil
+    from collections import Counter
+
+    man = json.loads((store.final / "manifest.json").read_text(encoding="utf-8"))
+    out = Path(args.out) if args.out else store.root / "release"
+    if out.exists():
+        shutil.rmtree(out)
+    (out / "views").mkdir(parents=True)
+    rows, n_pairs = [], 0
+    for sc in man["scenes"]:
+        name = sc["image"]
+        (out / "views" / name).mkdir()
+        (out / "masks" / name).mkdir(parents=True)
+        for v in sc["views"]:
+            vid = v["view_id"]
+            shutil.copy2(store.final / v["file"], out / "views" / name / f"{vid}.png")
+            shutil.copy2(store.final / v["mask"], out / "masks" / name / f"{vid}.png")
+            v["file"] = f"views/{name}/{vid}.png"
+            v["mask"] = f"masks/{name}/{vid}.png"
+            rows.append({
+                "file_name": f"{name}/{vid}.png", "scene": name, "category": sc["category"],
+                "view_id": vid, "kind": v["kind"],
+                **{k: v[k] for k in ("dx", "dy", "dz", "yaw_deg", "pitch_deg")},
+                "face_x": round(v["face_px"][0], 2), "face_y": round(v["face_px"][1], 2),
+                "target_x": round(v["target_px"][0], 2), "target_y": round(v["target_px"][1], 2),
+                "label_source": v["label_source"], "repair": v.get("repair") or "",
+                "mask": v["mask"],
+            })
+    (out / "manifest.json").write_text(json.dumps(man, indent=2, ensure_ascii=False), encoding="utf-8")
+    with open(out / "views" / "metadata.csv", "w", newline="", encoding="utf-8") as fh:
+        wr = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        wr.writeheader()
+        wr.writerows(rows)
+    with open(store.final / "pairs.csv", encoding="utf-8") as fi, \
+            open(out / "pairs.csv", "w", newline="", encoding="utf-8") as fo:
+        rd = csv.DictReader(fi)
+        wr = csv.DictWriter(fo, fieldnames=["scene", "category", "view_a", "view_b", "kind_a",
+                                            "kind_b", "file_a", "file_b", "angle_deg"])
+        wr.writeheader()
+        for r in rd:
+            wr.writerow({"scene": r["image"], "category": r["category"],
+                         "view_a": r["view_a"], "view_b": r["view_b"],
+                         "kind_a": r["kind_a"], "kind_b": r["kind_b"],
+                         "file_a": f"views/{r['image']}/{r['view_a']}.png",
+                         "file_b": f"views/{r['image']}/{r['view_b']}.png",
+                         "angle_deg": r["angle_deg"]})
+            n_pairs += 1
+
+    # distribution table for the card: 12 yaw bins x 3 pitch bins
+    grid = Counter()
+    for r in rows:
+        yb = yaw_bin(float(r["yaw_deg"]))
+        p = float(r["pitch_deg"])
+        pb = 0 if p < PITCH_EDGES[1] else (2 if p >= PITCH_EDGES[2] else 1)
+        grid[(pb, yb)] += 1
+    yaws = [yaw_bin_center(b) for b in range(N_YAW_BINS)]
+    dist = ["Views per gaze bin (yaw bin centre x pitch; all views):", "",
+            "| pitch \\ yaw | " + " | ".join(f"{y:g}" for y in yaws) + " |",
+            "|---|" + "---|" * len(yaws)]
+    for pb, pname in ((2, "up (>= 15)"), (1, "level"), (0, "down (< -15)")):
+        dist.append(f"| {pname} | " + " | ".join(str(grid[(pb, yb)]) for yb in range(N_YAW_BINS)) + " |")
+    cats = Counter(sc["category"] for sc in man["scenes"])
+    n_orig = sum(r["kind"] == "original" for r in rows)
+    card = (HF_CARD.replace("__NAME__", args.name).replace("__REPO__", args.repo or f"<user>/{args.name}")
+            .replace("__N_SCENES__", str(len(man["scenes"]))).replace("__N_VIEWS__", str(len(rows)))
+            .replace("__N_ORIG__", str(n_orig)).replace("__N_GEN__", str(len(rows) - n_orig))
+            .replace("__N_PAIRS__", str(n_pairs))
+            .replace("__CATS__", ", ".join(f"{c} ({n})" for c, n in sorted(cats.items())))
+            .replace("__DIST__", "\n".join(dist)))
+    (out / "README.md").write_text(card, encoding="utf-8")
+    size = sum(f.stat().st_size for f in out.rglob("*") if f.is_file()) / 2 ** 20
+    print(f"[Export HF] {len(man['scenes'])} scenes, {len(rows)} views, {n_pairs} pairs, "
+          f"{size:.0f} MB -> {out}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Eval-set GT generator (training-free pipeline)")
     ap.add_argument("--data", default=str(PROJECT_ROOT / "eval_dataset"),
@@ -3561,6 +3756,11 @@ def main():
     p.add_argument("--ids", nargs="+", metavar="ID")
     p.add_argument("--all", action="store_true")
 
+    p = sub.add_parser("export-hf", help="build an upload-ready Hugging Face dataset folder from final/")
+    p.add_argument("--out", help="output folder (default: <data>/release)")
+    p.add_argument("--name", default="GazeCtrl-Eval", help="dataset name in the card")
+    p.add_argument("--repo", help="HF repo id for the loading example, e.g. user/GazeCtrl-Eval")
+
     p = sub.add_parser("unrepair", help="drop the Gemini repair of some samples (back to inpaint)")
     p.add_argument("ids", nargs="+", metavar="ID")
 
@@ -3576,7 +3776,7 @@ def main():
      "stats": cmd_stats, "gallery": cmd_gallery, "label-source": cmd_label_source,
      "repair-select": cmd_repair_select, "repair": cmd_repair, "remerge": cmd_remerge,
      "repair-view": cmd_repair_view, "merge-select": cmd_merge_select, "unrepair": cmd_unrepair,
-     "face-check": cmd_face_check, "face-fix": cmd_face_fix,
+     "face-check": cmd_face_check, "export-hf": cmd_export_hf, "face-fix": cmd_face_fix,
      "issue-tag": cmd_issue_tag, "fix": cmd_fix, "fix-view": cmd_fix_view, "unfix": cmd_unfix,
      "finalize": cmd_finalize}[args.cmd](store, args)
 
