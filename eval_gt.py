@@ -2366,9 +2366,11 @@ def cmd_fix(store, args):
     the same tags/note/region unless --redo.
     """
     issues = load_issues(store)
-    todo = []
+    todo, untagged = [], []
     for d, m in _select_ids(accepted_candidates(store), args.ids):
         e = issues.get(cand_key(m))
+        if e and not e.get("tags") and (e.get("region") or e.get("note")):
+            untagged.append(cand_key(m))
         if not e or not e.get("tags"):
             continue
         region_p = d / "09r_region.png"
@@ -2384,6 +2386,9 @@ def cmd_fix(store, args):
         todo.append((d, m, region if has_region else None, prompt, sig))
     if args.limit:
         todo = todo[:args.limit]
+    if untagged:
+        print(f"[Fix] WARNING: {len(untagged)} view(s) painted or noted but with no tag, "
+              f"skipped (tag them in issue-tag): {' '.join(untagged)}")
     print(f"[Fix] {len(todo)} view(s) -> {len(todo)} Gemini call(s).")
     if not todo:
         return
